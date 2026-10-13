@@ -129,8 +129,10 @@ DFlash is `z-lab/Qwen3-8B-DFlash-b16` on SGLang's own DFLASH worker.
 | FlashMap, 1 jump | **520.0** | **1501.1** | 2318.7 | **439.6** |
 | FlashMap, 2 jumps | 501.0 | 1470.8 | **2324.5** | 408.1 |
 
-The SpecForge path matches DeepSpec's own sglang FlashMap path (same venv, flags
-and prompts) within 2% in every cell, usually slightly ahead.
+Against DeepSpec's own sglang FlashMap path (same venv, flags and prompts), the
+SpecForge path is within 2% at one jump in every cell, usually slightly ahead;
+at two jumps it is within 2% at concurrency 1 and 4 and 3-5% behind at 16 (one
+run per cell).
 
 ## SGLang internals touched
 
