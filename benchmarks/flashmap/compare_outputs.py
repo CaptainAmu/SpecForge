@@ -4,7 +4,8 @@ Speculative decoding is lossless at temperature 0: each server should
 reproduce the target's own greedy continuation. Batched verification runs the
 target's kernels on different shapes than plain decoding, so bf16 rounding can
 flip a near-tied argmax; this reports, per cell, how many outputs are
-identical and, for the rest, where they first diverge.
+identical and, for the rest, where they first diverge (check_greedy.py tests
+losslessness up to such ties).
 
     python benchmarks/flashmap/compare_outputs.py <OUT dir> [reference server]
 """
@@ -22,6 +23,8 @@ def load(out: str):
             row = json.loads(line)
             tag = dict(kv.split("=", 1) for kv in row["tag"].split(","))
             if "generated_texts" not in row or float(tag["temperature"]) != 0:
+                continue
+            if tag["server"].endswith("-warmup"):
                 continue
             key = (tag["task"], int(tag["concurrency"]))
             cells.setdefault(key, {})[tag["server"]] = row["generated_texts"]

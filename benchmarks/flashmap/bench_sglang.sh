@@ -60,19 +60,6 @@ server_cmd() {  # method draft -> the launch command for that method
     echo "${cmd[@]}"
 }
 
-bench() {  # name task concurrency prompts temperature
-    local name=$1 task=$2 c=$3 n=$4 temp=$5
-    head -n "${n}" "${PROMPTS}/${task}.jsonl" > "${OUT}/prompts-${task}-${n}.jsonl"
-    python -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port "${PORT}" \
-        --model "${TARGET}" --tokenizer "${TARGET}" \
-        --dataset-name custom --dataset-path "${OUT}/prompts-${task}-${n}.jsonl" \
-        --num-prompts "${n}" --sharegpt-output-len "${MAX_TOKENS}" \
-        --disable-ignore-eos --temperature "${temp}" --max-concurrency "${c}" --request-rate inf \
-        --flush-cache --seed 0 --disable-tqdm ${OUTPUT_DETAILS:+--output-details} \
-        --tag "server=${name},task=${task},concurrency=${c},prompts=${n},temperature=${temp}" \
-        --output-file "${OUT}/results-${name}.jsonl" > "${OUT}/bench-${name}-${task}-c${c}-t${temp}.log" 2>&1
-}
-
 run_server() {  # name=method[:draft][:env]
     local name=${1%%=*} spec=${1#*=}
     local method draft environment
@@ -103,19 +90,18 @@ run_server() {  # name=method[:draft][:env]
         kill "${pid}"; wait "${pid}" 2> /dev/null
         return 1
     fi
-    log "${name}: healthy; warming up"
-    bench "${name}-warmup" gsm8k 4 8 0
-    for cell in ${CELLS}; do
-        IFS=: read -r task c n temp <<<"${cell}"
-        bench "${name}" "${task}" "${c}" "${n}" "${temp}" || log "${name}: ${cell} failed"
-    done
+    log "${name}: healthy; benchmarking"
+    python "${REPO}/benchmarks/flashmap/run_cells.py" --name "${name}" --target "${TARGET}" \
+        --prompts "${PROMPTS}" --out "${OUT}" --cells "${CELLS}" --port "${PORT}" \
+        --max-tokens "${MAX_TOKENS}" ${OUTPUT_DETAILS:+--output-details} > "${OUT}/bench-${name}.log" 2>&1 \
+        || log "${name}: benchmark failed; see ${OUT}/bench-${name}.log"
     kill "${pid}"; wait "${pid}" 2> /dev/null
     log "${name}: done"
 }
 
 for server in ${SERVERS}; do
     if [[ -n ${GPU_LOCK} ]]; then
-        export -f run_server server_cmd bench log
+        export -f run_server server_cmd log
         export TARGET PROMPTS OUT CELLS MAX_TOKENS MEM_FRACTION MAX_RUNNING PORT REPO OUTPUT_DETAILS
         # GPU_TURNSTILE: taken first, so new shared holders queue behind us.
         ${GPU_TURNSTILE:+flock -x "${GPU_TURNSTILE}"} \
