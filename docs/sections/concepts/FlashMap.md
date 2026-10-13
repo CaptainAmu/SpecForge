@@ -108,9 +108,10 @@ so `model.vocab_mapping_path` is rejected.
 The paper's recipe trained the flow on 500k PerfectBlend conversations with
 regenerated target answers: 20 epochs at learning rate 6e-4, global batch 256
 sequences, and slot decay `gamma = 7`. The map then trained 12 epochs at 5e-5.
-It used AdamW with `betas = (0.9, 0.95)` and, for the flow, weight decay 0.1 on
-weight matrices, which removed loss spikes at that scale. SpecForge's optimizer
-does not expose betas or weight decay yet.
+It used AdamW with `betas = (0.9, 0.95)`, weight decay 0.1 on the flow's weight
+matrices (which removed loss spikes at that scale), and a warmup-stable-decay
+schedule for the map. SpecForge's optimizer does not expose betas, weight decay
+or that schedule yet; the recipes keep its AdamW defaults and cosine schedule.
 
 ## Export and serve
 
