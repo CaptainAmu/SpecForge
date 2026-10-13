@@ -37,7 +37,8 @@ MEM_FRACTION=${MEM_FRACTION:-0.8}
 MAX_RUNNING=${MAX_RUNNING:-32}
 PORT=${PORT:-31000}
 GPU_LOCK=${GPU_LOCK:-}
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+GPU_TURNSTILE=${GPU_TURNSTILE:-}
+REPO=${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}
 
 mkdir -p "${OUT}"
 log() { echo "[$(date '+%F %T')] $*"; }
@@ -116,7 +117,9 @@ for server in ${SERVERS}; do
     if [[ -n ${GPU_LOCK} ]]; then
         export -f run_server server_cmd bench log
         export TARGET PROMPTS OUT CELLS MAX_TOKENS MEM_FRACTION MAX_RUNNING PORT REPO OUTPUT_DETAILS
-        flock -x "${GPU_LOCK}" bash -c "run_server '${server}'"
+        # GPU_TURNSTILE: taken first, so new shared holders queue behind us.
+        ${GPU_TURNSTILE:+flock -x "${GPU_TURNSTILE}"} \
+            flock -x "${GPU_LOCK}" bash -c "run_server '${server}'"
     else
         run_server "${server}"
     fi
