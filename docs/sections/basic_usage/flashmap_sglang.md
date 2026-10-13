@@ -59,6 +59,12 @@ Environment knobs, read when the server starts:
 | `FLASHMAP_JUMP_BANK` / `FLASHMAP_JUMP_TOPK` | 8192 / 16 | multi-jump noise bank size / tokens kept per intermediate prediction |
 | `FLASHMAP_COMPILE` / `FLASHMAP_COMPILE_MODE` | 1 / default | torch.compile of the draft step |
 
+`--speculative-dspark-block-size` is the number of drafts verified per request
+(16, the whole block, by default). At high concurrency the target's verify pass
+becomes compute-bound and the last drafts of a block are rarely accepted, so a
+smaller value (e.g. 12 or 8) can raise throughput; the map still drafts its
+whole block, as it was trained, and only the first drafts are verified.
+
 Greedy (temperature 0) requests are lossless: every committed token is the
 target's own greedy choice. Sampling requests are verified by DSPARK's
 rejection sampling against the draft's logits.
