@@ -107,6 +107,31 @@ SERVERS="target=target fm1=flashmap:FlashMap-Qwen3-8B-sglang fm2=flashmap:FlashM
 python benchmarks/flashmap/compare_outputs.py logs/fm8b   # greedy outputs vs the target's
 ```
 
+## Results
+
+Qwen3-8B target, one A100-SXM4-80GB power-capped to 225 W (absolute speeds are
+low; compare rows), sglang 0.5.20, bf16, greedy unless noted, outputs up to 1024
+tokens, chat-templated prompts with thinking disabled (the first 16/32/64 prompts
+of each task at concurrency 1/4/16). Acceptance length counts the bonus token.
+DFlash is `z-lab/Qwen3-8B-DFlash-b16` on SGLang's own DFLASH worker.
+
+| Concurrency 1 | gsm8k accept | gsm8k tok/s | humaneval accept | humaneval tok/s | mt-bench accept | mt-bench tok/s |
+|---|---|---|---|---|---|---|
+| target alone | - | 84.9 | - | 84.5 | - | 84.6 |
+| DFlash | 6.20 | 396.8 (4.67x) | 6.20 | 391.4 (4.63x) | 2.28 | 148.9 (1.76x) |
+| FlashMap, 1 jump | 7.70 | **520.0 (6.12x)** | 5.71 | 382.6 (4.53x) | 2.41 | **164.8 (1.95x)** |
+| FlashMap, 2 jumps | 8.13 | 501.0 (5.90x) | 5.94 | 364.1 (4.31x) | 2.42 | 152.6 (1.80x) |
+
+| gsm8k throughput (tok/s) | concurrency 1 | concurrency 4 | concurrency 16 | concurrency 1, T=1 |
+|---|---|---|---|---|
+| target alone | 84.9 | 326.9 | 1018.6 | 84.3 |
+| DFlash | 396.8 | 1237.1 | 2019.2 | 342.6 |
+| FlashMap, 1 jump | **520.0** | **1501.1** | 2318.7 | **439.6** |
+| FlashMap, 2 jumps | 501.0 | 1470.8 | **2324.5** | 408.1 |
+
+The SpecForge path matches DeepSpec's own sglang FlashMap path (same venv, flags
+and prompts) within 2% in every cell, usually slightly ahead.
+
 ## SGLang internals touched
 
 Importing the package installs two hooks on `DSparkWorkerV2`, both active

@@ -45,9 +45,8 @@ def main():
     )
     args = parser.parse_args()
     tokenizer = AutoTokenizer.from_pretrained(args.target)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.target, dtype=torch.bfloat16, device_map="cuda"
-    ).eval()
+    model = AutoModelForCausalLM.from_pretrained(args.target, dtype=torch.bfloat16)
+    model = model.cuda().eval()
     for line in open(os.path.join(args.out, f"results-{args.server}.jsonl")):
         row = json.loads(line)
         tag = dict(kv.split("=", 1) for kv in row["tag"].split(","))
