@@ -257,7 +257,7 @@ specforge train --config ./my-eagle3-disaggregated.yaml
 
 ## Prepare offline target features
 
-Offline EAGLE3, DFlash, DFlash2, Domino, and DSpark runs consume
+Offline EAGLE3, DFlash, DFlash2, Domino, DSpark, and FlashMap runs consume
 target features created by `scripts/prepare_hidden_states.py`. Select the same
 strategy and draft
 configuration that the later training recipe uses; these values determine both
@@ -286,6 +286,7 @@ Use these strategy/model pairs for the checked-in offline colocated recipes:
 | DFlash | `Qwen/Qwen3-8B` | `configs/qwen3-8b-dflash.json` | `cache/hidden_states/qwen3-8b-dflash-sharegpt` |
 | Domino | `Qwen/Qwen3-8B` | `configs/qwen3-8b-domino.json` | `cache/hidden_states/qwen3-8b-domino-sharegpt` |
 | DSpark | `Qwen/Qwen3-4B` | `configs/qwen3-4b-dspark.json` | `cache/hidden_states/qwen3-4b-dspark-sharegpt` |
+| FlashMap | `Qwen/Qwen3-8B` | `configs/qwen3-8b-flashmap.json` | `cache/hidden_states/qwen3-8b-flashmap-perfectblend` |
 
 `--strategy` defaults to `eagle3` for compatibility. Pass it explicitly in
 reproducible jobs. `--draft-model-config` is required for Domino and DSpark;
@@ -299,7 +300,7 @@ Each output record contains the strategy's exact offline feature contract:
 | Strategy | Tensors in each `.ckpt` or `.ckpt.gz` record |
 | --- | --- |
 | EAGLE3 | `input_ids`, `loss_mask`, `hidden_state`, `aux_hidden_state` |
-| DFlash, DFlash2, and Domino | `input_ids`, `loss_mask`, `hidden_states` |
+| DFlash, DFlash2, Domino, and FlashMap | `input_ids`, `loss_mask`, `hidden_states` |
 | DSpark | `input_ids`, `loss_mask`, `hidden_states`, `target_last_hidden_states` |
 
 For the DFlash family, `hidden_states` concatenates the target layers selected

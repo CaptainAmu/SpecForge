@@ -1,0 +1,132 @@
+# FlashMap
+
+FlashMap is a block-parallel drafter. Like DFlash it drafts the 16 tokens
+after the last verified token (the anchor) in one pass, conditioned on the
+target's hidden states. Its block comes from a distilled discrete flow map
+(Flow Map Language Models, arXiv:2602.16813): one network evaluation jumps
+Gaussian noise over the target vocabulary straight to per-slot token
+distributions. Two jumps cost twice as much and are more accurate.
+
+| Boundary | FlashMap value |
+| --- | --- |
+| Training strategy | `training.strategy: flashmap` |
+| Stages | `training.flashmap_stage: flow`, then `map` |
+| Draft architecture | `FlashMapDraftModel` |
+| Online server capture | `--spec-capture-method dflash` |
+| Offline feature schema | DFlash `input_ids`, `loss_mask`, `hidden_states` |
+| Export target | `specforge export --to hf`, then `python -m specforge.export.flashmap` for SGLang |
+| SGLang serving algorithm | `DSPARK` with SpecForge's external FlashMap model ([guide](../basic_usage/flashmap_sglang.md)) |
+
+FlashMap reads the same target features as DFlash, so capture servers,
+offline feature files and the collator are DFlash's, and DFlash's anchor
+sampling, block labels and slot-decay loss weights are reused unchanged.
+
+## Architecture
+
+The draft is a DiT (6 blocks, width 2048, 16 heads) over the 16 draft slots.
+Each block runs AdaLN-zero-modulated self-attention within the block,
+cross-attention onto the context, and an MLP. The context is the target's
+hidden states at `target_layer_ids`, fused by `fc`, strictly before the
+anchor, plus the anchor token's embedding projected by `anchor_proj`. The
+target's embedding and LM head are frozen and borrowed, never draft weights:
+the embedding featurizes the noisy state, and the LM head turns the DiT
+output into logits.
+
+A block's state is a point `x` in the vocabulary space. The DiT reads it at
+time `s` through `softmax(s x / (1 - s)^2) @ E`, the posterior over the clean
+token, normalized by `state_norm`. The map also reads `x @ E` itself through
+`noise_norm`, gated by `t - s`, because at `s = 0` the posterior is uniform
+whatever the noise. AdaLN conditions on embeddings of the start time `s` and,
+for the map, the end time `t` (`jump_embed`).
+
+## Two training stages
+
+**Flow (`flashmap_stage: flow`).** The DiT is trained as the denoiser of the
+path `I_t = (1 - t) z + t onehot(y)`: cross entropy against the block's clean
+tokens. Every anchor block is noised to its own time `t(tau)`, `tau ~ U[0, 1]`
+under the decoding-error schedule (Flow Map Language Models, eq. 25). The
+`flashmap/ce_loss@tau{0..3}` metrics split the loss by quartile of `tau`.
+
+**Map (`flashmap_stage: map`).** The flow at `model.flashmap_flow_checkpoint`
+is frozen and the map starts as a copy of it. Its end-time embedding starts at
+zero, and its noise read-out is gated off on the diagonal `s = t`, so the
+initial map is exactly the flow. Training uses the semigroup objective (eq. 23,
+Algorithm 7) with the official implementation's batch split:
+
+- `flashmap_diagonal_fraction` (0.5) of the blocks train `delta_{t,t}` against
+  the frozen flow's denoiser;
+- of the rest, `flashmap_boundary_prob` (0.0625) take the drafting jump
+  `(s, t) = (0, 1)`, and the others take a jump `s -> t` with midpoint `u`;
+- off-diagonal blocks are trained toward the map's own two half-jumps,
+  `gamma delta_{s,u} + (1 - gamma) delta_{u,t}`, under stop-gradient;
+- times are drawn in the schedule's `tau` and stratified over the batch
+  (`flashmap_antithetic_sampling`).
+
+The loss is soft-target cross entropy, which has the same gradients as the
+KL the paper uses. `map_kl` reports the KL, overall and for the
+`diag`/`off`/`boundary` groups. `flashmap/acc@boundary` is the argmax
+accuracy of the jump that drafting uses. Each map step evaluates the network
+three times on vocabulary-sized states, so the map draws fewer anchors per
+sequence than the flow (`num_anchors` 128 versus 512).
+
+## Train
+
+Both stages use the checked-in draft config, which matches the released
+FlashMap checkpoints. The stage selects the network (`flow_map` in the
+config), so a stage-1 flow has no `jump_embed`, `noise_norm` or `noise_gate`.
+
+```bash
+# features (offline), with the DFlash capture
+torchrun --nproc_per_node=8 scripts/prepare_hidden_states.py \
+    --strategy flashmap --target-model-path Qwen/Qwen3-8B \
+    --draft-model-config configs/qwen3-8b-flashmap.json \
+    --data-path ./cache/dataset/perfectblend_qwen3-8b_regen.jsonl \
+    --output-path ./cache/hidden_states/qwen3-8b-flashmap-perfectblend \
+    --chat-template qwen --max-length 4096
+
+# stage 1: the flow
+specforge train --config examples/configs/offline/colocated/qwen3-8b-flashmap-flow-offline.yaml
+
+# stage 2: distil the flow into the map
+specforge train --config examples/configs/offline/colocated/qwen3-8b-flashmap-map-offline.yaml
+```
+
+`model.flashmap_flow_checkpoint` accepts a stage-1 run directory, checkpoint
+directory or `training_state.pt`, or an exported model directory. The map
+starts from that flow unless `model.draft_checkpoint_path` warm-starts it from
+an existing map, and resuming a map run (`training.resume_from`) still needs
+the flow path for its teacher. Online recipes,
+`examples/configs/online/disaggregated/external/qwen3-4b-flashmap-{flow,map}-online.yaml`,
+train both stages from a DFlash capture server.
+
+A draft config can also be derived from the target by omitting
+`model.draft_model_config`. The default is the 6-block, width-2048 DiT over five
+target layers, chosen as DFlash chooses them. FlashMap trains over the full
+target vocabulary: the serving export can restrict the drafting vocabulary,
+so `model.vocab_mapping_path` is rejected.
+
+The paper's recipe trained the flow on 500k PerfectBlend conversations with
+regenerated target answers: 20 epochs at learning rate 6e-4, global batch 256
+sequences, and slot decay `gamma = 7`. The map then trained 12 epochs at 5e-5.
+It used AdamW with `betas = (0.9, 0.95)` and, for the flow, weight decay 0.1 on
+weight matrices, which removed loss spikes at that scale. SpecForge's optimizer
+does not expose betas or weight decay yet.
+
+## Export and serve
+
+A map checkpoint exports to the released FlashMap layout: `config.json` with
+`model_type: flashmap`, and the draft's own weights without the target's
+embedding and LM head.
+
+```bash
+specforge export --to hf \
+    --checkpoint ./outputs/qwen3-8b-flashmap-map-offline \
+    --draft-config configs/qwen3-8b-flashmap.json \
+    --output-dir ./exports/FlashMap-Qwen3-8B
+
+python -m specforge.export.flashmap \
+    --src ./exports/FlashMap-Qwen3-8B --output-dir ./exports/FlashMap-Qwen3-8B-sglang
+```
+
+Then serve the second directory as described in
+[Serving FlashMap with SGLang](../basic_usage/flashmap_sglang.md).

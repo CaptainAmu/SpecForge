@@ -366,6 +366,17 @@ See the dedicated [DFlash2 guide](../concepts/DFlash2.md) for the complete
 model-field constraints, offline feature workflow, selector schedule, and
 serving compatibility boundary.
 
+### FlashMap
+
+FlashMap trains in two runs of `training.strategy: flashmap`. The first, with
+`training.flashmap_stage: flow`, trains a flow over the 16-token draft block.
+The second, with `training.flashmap_stage: map` and
+`model.flashmap_flow_checkpoint` pointing at the first run, distils that flow
+into the one-step flow map that is served. Both runs consume DFlash's capture
+(`--spec-capture-method dflash`, or `scripts/prepare_hidden_states.py
+--strategy flashmap`). See the [FlashMap guide](../concepts/FlashMap.md) for the
+objectives, metrics, recipes and export.
+
 Domino and DSpark need their projector/head metadata, so they require an
 explicit draft config (or a pretrained warm-start source that contains
 `config.json`). The old Domino parser exposed an optional config flag, but its
@@ -420,6 +431,8 @@ The checked-in examples are the canonical starting points:
 | Domino | Offline colocated | [`qwen3-8b-domino-offline.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-8b-domino-offline.yaml) |
 | DSpark | Online disaggregated, external | [`qwen3-4b-dspark-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-4b-dspark-disaggregated.yaml) |
 | DSpark | Offline colocated | [`qwen3-4b-dspark-offline.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-4b-dspark-offline.yaml) |
+| FlashMap | Online disaggregated, external | [`qwen3-4b-flashmap-flow-online.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-4b-flashmap-flow-online.yaml), then [`qwen3-4b-flashmap-map-online.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-4b-flashmap-map-online.yaml) |
+| FlashMap | Offline colocated | [`qwen3-8b-flashmap-flow-offline.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-8b-flashmap-flow-offline.yaml), then [`qwen3-8b-flashmap-map-offline.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-8b-flashmap-map-offline.yaml) |
 | DFlash (Ascend) | Online disaggregated, external | [`qwen3.5-4b-dflash-online-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml) |
 | MTP (Ascend) | Online disaggregated, managed-local | [`qwen3.5-4b-mtp-disaggregated-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.5-4b-mtp-disaggregated-npu.yaml) |
 
@@ -450,6 +463,7 @@ The unified runtime supports text training in these combinations:
 | DFlash/DFlash2 | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | Domino | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | DSpark | Yes, consumer DP | Yes, DP | Yes, consumer DP |
+| FlashMap | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | MTP | Yes, consumer DP | Yes, DP | Yes, consumer DP |
 | P-EAGLE | Yes, consumer DP, batch size 1 | No | No |
 
@@ -463,11 +477,12 @@ assembly. In particular:
 - attention backends are strategy-specific: EAGLE3 accepts `sdpa`,
   `flex_attention`, `fa`, or offline `usp`; P-EAGLE requires
   `flex_attention`; DFlash, DFlash2, Domino, and DSpark accept
-  `eager`, `sdpa`, or `flex_attention`; MTP accepts `eager` or `sdpa`;
+  `eager`, `sdpa`, or `flex_attention`; FlashMap accepts `sdpa` or
+  `flex_attention`; MTP accepts `eager` or `sdpa`;
 - P-EAGLE requires `training.batch_size=1` and reuses EAGLE3's server capture
   schema;
 - offline feature training supports EAGLE3, DFlash, DFlash2, Domino,
-  DSpark, and MTP;
+  DSpark, FlashMap, and MTP;
 - every online run is disaggregated and uses `model.target_backend=sglang`;
   finite runs may omit both step fields so the producer can publish the exact
   optimizer horizon derived from the prepared prompt plan;
@@ -677,7 +692,10 @@ specforge export --to sglang \
 ```
 
 `--to sglang` currently implements the EAGLE3 serving-key contract. Use
-`--to hf` for DFlash, DFlash2, Domino, DSpark, and P-EAGLE model directories.
+`--to hf` for DFlash, DFlash2, Domino, DSpark, FlashMap, and P-EAGLE model
+directories; a FlashMap export is the released FlashMap layout, which
+`python -m specforge.export.flashmap` prepares for SGLang (see
+[FlashMap](../concepts/FlashMap.md)).
 For an EAGLE-family self-contained Hugging Face directory, provide the target model as
 the source of the frozen embedding when it is absent from the runtime
 checkpoint:

@@ -438,6 +438,8 @@ class FlashMapPreTrainedModel(PreTrainedModel):
     config_class = FlashMapConfig
     base_model_prefix = "flashmap"
     _no_split_modules = ["FlashMapDecoderLayer"]
+    _supports_sdpa = True
+    _supports_flex_attn = True
 
     @torch.no_grad()
     def _init_weights(self, module: nn.Module) -> None:
