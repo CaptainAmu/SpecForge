@@ -2,6 +2,7 @@
 """FlashMap draft model, its two-stage training wrapper, and its registration."""
 
 import copy
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -21,6 +22,7 @@ from specforge.modeling.draft.flashmap import (
     FlashMapDraftModel,
     create_context_mask,
 )
+from specforge.training.model_loading import warm_start_draft_model
 
 VOCAB = 64
 TARGET_HIDDEN = 32
@@ -115,6 +117,18 @@ class FlashMapModelTest(unittest.TestCase):
             | {key for key in keys if key.startswith("jump_embed.")},
             keys - flow_keys,
         )
+
+    def test_pretrained_warm_start_keeps_the_loaded_weights(self):
+        model = randomize(FlashMapDraftModel(tiny_config()))
+        loaded = FlashMapDraftModel(tiny_config())
+        with tempfile.TemporaryDirectory() as directory:
+            model.save_pretrained(directory)
+            warm_start_draft_model(
+                loaded, directory, draft_config=tiny_config(), strategy="flashmap"
+            )
+        expected = model.state_dict()
+        for name, tensor in loaded.state_dict().items():
+            torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
 
     def test_jump_grids_match_the_released_qwen3_schedule(self):
         grids = FlashMapConfig().jump_grids
