@@ -594,22 +594,32 @@ class FlashMapDraftModel(nn.Module):
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
         """A block for every request; returns the DiT's final hidden states,
-        which ``compute_base_logits`` (or the folded sampler) maps to logits."""
+        which ``compute_base_logits`` (or the folded sampler) maps to logits.
+
+        DSPARK asks for ``gamma`` drafts per request, the block size unless
+        ``--speculative-num-draft-tokens`` verifies fewer (at high concurrency
+        the target's verify is compute-bound and the last drafts are rarely
+        accepted); the map always drafts its whole block, as it was trained,
+        and hands over the first ``gamma``."""
         del input_embeds, get_embedding, pp_proxy_tensors
         bsz, block_size = forward_batch.batch_size, self.block_size
+        gamma = positions.numel() // bsz
         pool = get_token_to_kv_pool()
-        block_positions = positions.view(bsz, block_size)
+        anchor_positions = positions.view(bsz, gamma)[:, 0]
+        block_positions = anchor_positions[:, None] + torch.arange(
+            block_size, device=positions.device
+        )
         # The anchor's context entry goes into its own slot, the first of the
         # request's verify window, so each request attends to positions
         # 0..anchor; committing the verified tokens later overwrites the slot.
         meta, k_norm_weights, cos_sin, kv_size = self._fused_write_args(pool)
         fused_kv_norm_rope_write(
-            self._anchor_kv(input_ids.view(bsz, block_size)[:, 0]),
+            self._anchor_kv(input_ids.view(bsz, gamma)[:, 0]),
             meta,
             k_norm_weights,
             cos_sin,
-            block_positions[:, 0],
-            forward_batch.out_cache_loc.view(bsz, block_size)[:, 0],
+            anchor_positions,
+            forward_batch.out_cache_loc.view(bsz, gamma)[:, 0],
             self.num_stages,
             kv_size,
             self.head_dim,
@@ -631,6 +641,10 @@ class FlashMapDraftModel(nn.Module):
             [pool.get_key_buffer(i) for i in range(self.num_stages)],
             [pool.get_value_buffer(i) for i in range(self.num_stages)],
         )
+        if gamma < block_size:
+            hidden = hidden.view(bsz, block_size, -1)[:, :gamma].reshape(
+                bsz * gamma, -1
+            )
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=hidden)
 
     def _anchor_kv_impl(self, anchor_ids: torch.Tensor) -> torch.Tensor:

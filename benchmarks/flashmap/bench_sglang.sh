@@ -9,7 +9,8 @@
 # name=method[:draft dir][:env assignments separated by +]:
 #
 #   target                    the target alone
-#   flashmap:<export>         FlashMap via DSPARK (python -m specforge.export.flashmap)
+#   flashmap:<export>         FlashMap via DSPARK (python -m specforge.export.flashmap);
+#                             flashmap@<g>:<export> verifies only the first g drafts
 #   dflash:<draft>            sglang's DFlash (e.g. z-lab/Qwen3-8B-DFlash-b16)
 #   dspark:<draft>            another DSPARK draft; extra modules via SGLANG_EXTERNAL_MODEL_PACKAGE in its env
 #
@@ -50,9 +51,11 @@ server_cmd() {  # method draft -> the launch command for that method
                --max-running-requests "${MAX_RUNNING}" --cuda-graph-max-bs-decode "${MAX_RUNNING}")
     case ${method} in
         target) ;;
-        flashmap|dspark)
+        flashmap*|dspark*)  # flashmap@<g>: verify only the first g of the 16 drafts
+            local gamma=16
+            [[ ${method} == *@* ]] && gamma=${method#*@}
             cmd+=(--speculative-algorithm DSPARK --speculative-draft-model-path "${draft}"
-                  --speculative-dspark-block-size 16) ;;
+                  --speculative-dspark-block-size "${gamma}") ;;
         dflash)
             cmd+=(--speculative-algorithm DFLASH --speculative-draft-model-path "${draft}") ;;
         *) echo "unknown method ${method}" >&2; return 1 ;;
@@ -70,7 +73,7 @@ run_server() {  # name=method[:draft][:env]
     (
         export PYTHONPATH=${REPO}${PYTHONPATH:+:${PYTHONPATH}}
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=${SGLANG_ENABLE_OVERLAP_PLAN_STREAM:-1}
-        [[ ${method} == flashmap ]] && export SGLANG_EXTERNAL_MODEL_PACKAGE=specforge.serving.sglang
+        [[ ${method} == flashmap* ]] && export SGLANG_EXTERNAL_MODEL_PACKAGE=specforge.serving.sglang
         for assignment in ${environment//+/ }; do export "${assignment}"; done
         exec ${cmd}
     ) > "${OUT}/server-${name}.log" 2>&1 &
@@ -85,7 +88,7 @@ run_server() {  # name=method[:draft][:env]
         fi
         sleep 5
     done
-    if [[ ${method} == flashmap ]] && ! grep -q "FlashMap draft sampler: one pass" "${OUT}/server-${name}.log"; then
+    if [[ ${method} == flashmap* ]] && ! grep -q "FlashMap draft sampler: one pass" "${OUT}/server-${name}.log"; then
         log "${name}: the FlashMap draft did not load (no 'FlashMap draft sampler' line)"
         kill "${pid}"; wait "${pid}" 2> /dev/null
         return 1
