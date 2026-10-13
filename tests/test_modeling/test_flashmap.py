@@ -11,6 +11,7 @@ from torch import nn
 
 from specforge.algorithms.flashmap.model import BOUNDARY, DIAGONAL, OnlineFlashMapModel
 from specforge.algorithms.flashmap.providers import (
+    build_training_model,
     initialize_map_from_flow,
     populate_target_defaults,
 )
@@ -255,6 +256,19 @@ class FlashMapProviderTest(unittest.TestCase):
         self.assertEqual(2048, generated.hidden_size)
         self.assertEqual(16, generated.num_attention_heads)
         self.assertEqual(10000.0, generated.rope_theta)
+
+    def test_map_stage_requires_its_flow(self):
+        config = SimpleNamespace(
+            model=SimpleNamespace(
+                flashmap_flow_checkpoint=None,
+                vocab_mapping_path="",
+                draft_checkpoint_path=None,
+            ),
+            training=SimpleNamespace(flashmap_stage="map", strategy="flashmap"),
+        )
+        draft = FlashMapDraftModel(tiny_config())
+        with self.assertRaisesRegex(ValueError, "flashmap_flow_checkpoint"):
+            build_training_model(config, draft, tiny_config(), None, None)
 
     def test_map_init_rejects_a_mismatched_flow(self):
         draft = FlashMapDraftModel(tiny_config())
