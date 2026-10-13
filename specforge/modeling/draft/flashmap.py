@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 from transformers import PretrainedConfig, PreTrainedModel
+from transformers import initialization as init
 from transformers.integrations.flex_attention import compile_friendly_flex_attention
 
 from .registry import register_draft
@@ -443,19 +444,19 @@ class FlashMapPreTrainedModel(PreTrainedModel):
 
     @torch.no_grad()
     def _init_weights(self, module: nn.Module) -> None:
-        std = self.config.initializer_range
+        # transformers' init functions skip tensors loaded from a checkpoint.
         if isinstance(module, nn.Linear):
             # AdaLN modulations, the output head and the end-time embedding
             # start at zero: every block starts as the identity, the draft as
             # the uniform distribution, and a map as the flow it came from.
             if getattr(module, "_flashmap_zero_init", False):
-                module.weight.zero_()
+                init.zeros_(module.weight)
             else:
-                module.weight.normal_(mean=0.0, std=std)
+                init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
-                module.bias.zero_()
+                init.zeros_(module.bias)
         elif isinstance(module, FlashMapRMSNorm):
-            module.weight.fill_(1.0)
+            init.ones_(module.weight)
 
 
 @register_draft
