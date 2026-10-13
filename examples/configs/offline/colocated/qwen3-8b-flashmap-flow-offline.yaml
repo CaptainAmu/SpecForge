@@ -1,0 +1,42 @@
+# FlashMap stage 1: train the flow that the served flow map is distilled from.
+# Features are DFlash's; prepare them with
+#   scripts/prepare_hidden_states.py --strategy flashmap \
+#     --draft-model-config configs/qwen3-8b-flashmap.json ...
+model:
+  target_model_path: Qwen/Qwen3-8B
+  draft_model_config: configs/qwen3-8b-flashmap.json
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: ./cache/hidden_states/qwen3-8b-flashmap-perfectblend
+  max_length: 4096
+  chat_template: qwen
+  cache_dir: ./cache
+
+training:
+  strategy: flashmap
+  flashmap_stage: flow
+  num_epochs: 20
+  batch_size: 1
+  accumulation_steps: 32
+  learning_rate: 6.0e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  save_interval: 2000
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+
+run_id: qwen3-8b-flashmap-flow-offline
+output_dir: ./outputs/qwen3-8b-flashmap-flow-offline
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

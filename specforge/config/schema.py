@@ -274,6 +274,9 @@ class ModelConfig(StrictConfigModel):
     draft_num_hidden_layers: Optional[int] = Field(default=None, gt=0)
     #: Optional DFlash block-size override (auto-generated default: 16).
     draft_block_size: Optional[int] = Field(default=None, gt=0)
+    #: FlashMap map stage: the trained flow it distils (a SpecForge checkpoint
+    #: or exported directory). The map starts as a copy of it.
+    flashmap_flow_checkpoint: Optional[str] = None
     #: Online capture always runs on an external SGLang server; the in-process
     #: HF/custom target backends were removed with the server-only cutover, so
     #: configs naming them fail at load instead of being silently ignored.
@@ -963,6 +966,14 @@ class TrainingConfig(StrictConfigModel):
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0
+    #: FlashMap trains a flow first, then distils it into the served map.
+    flashmap_stage: Literal["flow", "map"] = "flow"
+    #: Map stage semigroup objective: the share of blocks on the diagonal (the
+    #: frozen flow's denoiser as teacher), the share of the rest on the
+    #: drafting jump (0, 1), and stratified time draws.
+    flashmap_diagonal_fraction: float = Field(default=0.5, ge=0.0, le=1.0)
+    flashmap_boundary_prob: float = Field(default=0.0625, ge=0.0, le=1.0)
+    flashmap_antithetic_sampling: bool = True
     #: P-EAGLE COD sampling/model knobs.
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8

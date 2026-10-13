@@ -630,6 +630,56 @@ class DSparkTrainStrategy(DraftTrainStrategy):
         }
 
 
+class FlashMapTrainStrategy(DraftTrainStrategy):
+    """FlashMap strategy over ``OnlineFlashMapModel`` (flow or map stage).
+
+    Consumes DFlash's features; the loss is token-pooled through
+    ``loss_terms``. The frozen flow teacher of the map stage is not a
+    registered module, so only the draft is checkpointed.
+    """
+
+    name = "flashmap"
+    required_features = {"input_ids", "hidden_states", "loss_mask"}
+
+    def __init__(self, flashmap_model: nn.Module) -> None:
+        self.flashmap_model = flashmap_model
+
+    def trainable_module(self) -> nn.Module:
+        return self.flashmap_model
+
+    def _device(self) -> torch.device:
+        return next(self.flashmap_model.parameters()).device
+
+    def forward_loss(
+        self, batch: TrainBatch, ctx: Optional[StepContext] = None
+    ) -> StepOutput:
+        self.validate_batch(batch)
+        t = batch.tensors
+        device = self._device()
+        loss, accuracy, model_metrics = self.flashmap_model(
+            input_ids=t["input_ids"].to(device, non_blocking=True),
+            hidden_states=t["hidden_states"].to(device, non_blocking=True),
+            loss_mask=t["loss_mask"].to(device, non_blocking=True),
+            max_valid_anchors=_cpu_max_valid_anchors(t["loss_mask"]),
+        )
+        return StepOutput(
+            loss=loss,
+            metrics={
+                "accuracy": accuracy.detach(),
+                "accuracy_denom": model_metrics["accuracy_denom"],
+            },
+            ratio_metrics=model_metrics["ratio_metrics"],
+            loss_terms=model_metrics["loss_terms"],
+        )
+
+    def checkpoint_state_filter(self, state_dict: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            k.replace("draft_model.", ""): v
+            for k, v in state_dict.items()
+            if "draft_model." in k
+        }
+
+
 class MTPTrainStrategy(DraftTrainStrategy):
     """MTP strategy over ``OnlineMTPModel`` with final-hidden supervision."""
 
