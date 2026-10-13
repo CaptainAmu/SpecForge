@@ -172,7 +172,9 @@ def sglang_config(
 ) -> Dict:
     """The sglang draft config for a release ``config`` (see the module
     docstring)."""
-    flashmap = {k: v for k, v in config.items() if k not in ("architectures", "auto_map")}
+    flashmap = {
+        k: v for k, v in config.items() if k not in ("architectures", "auto_map")
+    }
     flashmap["num_steps"] = int(num_steps)
     assert str(num_steps) in flashmap["jump_grids"], (num_steps, flashmap["jump_grids"])
     heads = int(config["num_attention_heads"])
@@ -242,7 +244,9 @@ def export_flashmap_to_sglang(
         json.dump(out, handle, indent=2)
     tensors = {name: tensor.contiguous() for name, tensor in state.items()}
     save_file(
-        tensors, os.path.join(output_dir, "model.safetensors"), metadata={"format": "pt"}
+        tensors,
+        os.path.join(output_dir, "model.safetensors"),
+        metadata={"format": "pt"},
     )
     return output_dir
 

@@ -47,12 +47,12 @@ def _block_self_attention_kernel(
     k_odd = tl.load(row + H * D + 2 * i + 1).to(tl.float32)
 
     # RMSNorm: x * bf16(weight * rsqrt(mean(x^2) + eps)), in bf16.
-    q_rms = tl.rsqrt(
-        (tl.sum(q_even * q_even, 1) + tl.sum(q_odd * q_odd, 1)) / D + eps
-    )[:, None]
-    k_rms = tl.rsqrt(
-        (tl.sum(k_even * k_even, 1) + tl.sum(k_odd * k_odd, 1)) / D + eps
-    )[:, None]
+    q_rms = tl.rsqrt((tl.sum(q_even * q_even, 1) + tl.sum(q_odd * q_odd, 1)) / D + eps)[
+        :, None
+    ]
+    k_rms = tl.rsqrt((tl.sum(k_even * k_even, 1) + tl.sum(k_odd * k_odd, 1)) / D + eps)[
+        :, None
+    ]
     q_even = _scale(q_even, tl.load(q_norm_ptr + 2 * i) * q_rms)
     q_odd = _scale(q_odd, tl.load(q_norm_ptr + 2 * i + 1) * q_rms)
     k_even = _scale(k_even, tl.load(k_norm_ptr + 2 * i) * k_rms)

@@ -23,7 +23,6 @@ token ids in the graph too.
 from __future__ import annotations
 
 import torch
-
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import SampleStepTokens
 from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (

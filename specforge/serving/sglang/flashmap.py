@@ -61,8 +61,6 @@ from typing import Iterable, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from sgl_kernel.flash_attn import flash_attn_with_kvcache, get_scheduler_metadata
-from torch import nn
-
 from sglang.kernels.ops.speculative.dspark.fused_kv_write import (
     fused_kv_norm_rope_write,
 )
@@ -73,6 +71,8 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.speculative.dspark_components import dspark_worker_v2
+from torch import nn
+
 from specforge.serving.sglang.flashmap_jump_bank import JumpNoiseBank, top_predictions
 from specforge.serving.sglang.flashmap_kernels import (
     block_self_attention,
@@ -138,9 +138,7 @@ def rope_freqs(positions: torch.Tensor, head_dim: int, base: float) -> torch.Ten
     RoPE rotates interleaved pairs of channels ``(2i, 2i + 1)``."""
     inv_freq = 1.0 / (
         base
-        ** (
-            torch.arange(0, head_dim, 2, device=positions.device).float() / head_dim
-        )
+        ** (torch.arange(0, head_dim, 2, device=positions.device).float() / head_dim)
     )
     angles = positions.float()[..., None] * inv_freq
     return torch.stack([angles.cos(), angles.sin()], dim=-1)
@@ -165,11 +163,15 @@ def _timestep_embedding(t: torch.Tensor, dim: int, max_period: float = 10000.0):
 
 
 class _Norm(nn.Module):
-    """A weight-only RMSNorm's parameter (applied by the fused kernels)."""
+    """FlashMap's RMSNorm (most are applied by the fused kernels instead)."""
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, eps: float):
         super().__init__()
+        self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim), requires_grad=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _rms_norm(x, self.weight.float(), self.eps)
 
 
 class _TimeEmbedding(nn.Module):
@@ -196,14 +198,14 @@ class _AdaLN(nn.Module):
 
 
 class _Attention(nn.Module):
-    def __init__(self, dim: int, heads: int):
+    def __init__(self, dim: int, heads: int, eps: float):
         super().__init__()
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
         self.o_proj = nn.Linear(dim, dim, bias=False)
-        self.q_norm = _Norm(dim // heads)
-        self.k_norm = _Norm(dim // heads)
+        self.q_norm = _Norm(dim // heads, eps)
+        self.k_norm = _Norm(dim // heads, eps)
 
 
 class _MLP(nn.Module):
@@ -214,12 +216,12 @@ class _MLP(nn.Module):
 
 
 class _Layer(nn.Module):
-    def __init__(self, dim: int, heads: int, mlp_dim: int, cond_dim: int):
+    def __init__(self, dim: int, heads: int, mlp_dim: int, cond_dim: int, eps: float):
         super().__init__()
         self.self_attn_adaln = _AdaLN(dim, cond_dim)
-        self.self_attn = _Attention(dim, heads)
+        self.self_attn = _Attention(dim, heads, eps)
         self.cross_attn_adaln = _AdaLN(dim, cond_dim)
-        self.cross_attn = _Attention(dim, heads)
+        self.cross_attn = _Attention(dim, heads, eps)
         self.mlp_adaln = _AdaLN(dim, cond_dim)
         self.mlp = _MLP(dim, mlp_dim)
 
@@ -265,17 +267,24 @@ class FlashMapDraftModel(nn.Module):
 
         # The released weights, under their release names.
         self.fc = nn.Linear(context_features, self.dim, bias=False)
-        self.hidden_norm = _Norm(self.dim)
+        eps = self.rms_norm_eps
+        self.hidden_norm = _Norm(self.dim, eps)
         self.anchor_proj = nn.Linear(self.target_hidden_size, self.dim)
-        self.anchor_norm = _Norm(self.dim)
-        self.state_norm_weight = _Norm(self.target_hidden_size)
-        self.noise_norm_weight = _Norm(self.target_hidden_size)
+        self.anchor_norm = _Norm(self.dim, eps)
+        self.state_norm = _Norm(self.target_hidden_size, eps)
+        self.noise_norm = _Norm(self.target_hidden_size, eps)
         self.noise_gate = nn.Parameter(torch.zeros(1), requires_grad=False)
         self.x_embed = nn.Linear(self.target_hidden_size, self.dim)
         self.time_embed = _TimeEmbedding(int(fm["time_embed_dim"]), cond_dim)
         self.jump_embed = _TimeEmbedding(int(fm["time_embed_dim"]), cond_dim)
         self.layers = nn.ModuleList(
-            _Layer(self.dim, self.num_heads, int(fm["intermediate_size"]), cond_dim)
+            _Layer(
+                self.dim,
+                self.num_heads,
+                int(fm["intermediate_size"]),
+                cond_dim,
+                self.qk_norm_eps,
+            )
             for _ in range(self.num_stages)
         )
         self.final_adaln = _AdaLN(self.dim, cond_dim)
@@ -323,14 +332,11 @@ class FlashMapDraftModel(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params = dict(self.named_parameters())
-        renames = {"state_norm.weight": "state_norm_weight.weight"}
-        renames["noise_norm.weight"] = "noise_norm_weight.weight"
         loaded = set()
         for name, tensor in weights:
             if name == "draft_vocab_ids":
                 self._vocab_ranking = tensor
                 continue
-            name = renames.get(name, name)
             if name not in params:
                 raise KeyError(f"unexpected FlashMap weight {name!r}")
             with torch.no_grad():
@@ -346,7 +352,9 @@ class FlashMapDraftModel(nn.Module):
         # layer); each k_proj/v_proj weight becomes a view of its rows.
         self._ctx_kv_weight = torch.cat(
             [
-                torch.cat([layer.cross_attn.k_proj.weight, layer.cross_attn.v_proj.weight])
+                torch.cat(
+                    [layer.cross_attn.k_proj.weight, layer.cross_attn.v_proj.weight]
+                )
                 for layer in layers
             ]
         )
@@ -358,23 +366,25 @@ class FlashMapDraftModel(nn.Module):
         self._self_qkv_weights = []
         for layer in layers:
             attn = layer.self_attn
-            qkv = torch.cat([attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight])
+            qkv = torch.cat(
+                [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight]
+            )
             attn.q_proj.weight.data = qkv[: self.dim]
             attn.k_proj.weight.data = qkv[self.dim : 2 * self.dim]
             attn.v_proj.weight.data = qkv[2 * self.dim :]
             self._self_qkv_weights.append(qkv)
         # The norms' weights in float32, as the kernels take them.
         self._self_norm_weights = [
-            (layer.self_attn.q_norm.weight.float(), layer.self_attn.k_norm.weight.float())
+            (
+                layer.self_attn.q_norm.weight.float(),
+                layer.self_attn.k_norm.weight.float(),
+            )
             for layer in layers
         ]
         self._cross_q_norm_weights = [
             layer.cross_attn.q_norm.weight.float() for layer in layers
         ]
         self._hidden_norm_weight = self.hidden_norm.weight.float()
-        self._anchor_norm_weight = self.anchor_norm.weight.float()
-        self._state_norm_weight = self.state_norm_weight.weight.float()
-        self._noise_norm_weight = self.noise_norm_weight.weight.float()
 
     def attach_shared_modules(self, *, embed_tokens: nn.Module, lm_head: nn.Module):
         """DSPARK hands over the target's embedding and LM head; everything the
@@ -450,7 +460,11 @@ class FlashMapDraftModel(nn.Module):
             cond = self.time_embed(times[:, 0]) + self.jump_embed(times[:, 1])
             modulations = []
             for layer in self.layers:
-                adalns = (layer.self_attn_adaln, layer.cross_attn_adaln, layer.mlp_adaln)
+                adalns = (
+                    layer.self_attn_adaln,
+                    layer.cross_attn_adaln,
+                    layer.mlp_adaln,
+                )
                 chunks = [adaln(cond) for adaln in adalns]
                 modulations.append(
                     tuple((1 + scale, shift, gate) for scale, shift, gate in chunks)
@@ -474,14 +488,6 @@ class FlashMapDraftModel(nn.Module):
             gram += part.T @ part
         noise_factor = torch.linalg.cholesky(gram).T.to(embedding.dtype)
         return per_jump, uniform, noise_factor
-
-    # --- the featurization's pieces (also used by the jump bank) -------------
-
-    def state_norm(self, x: torch.Tensor) -> torch.Tensor:
-        return _rms_norm(x, self._state_norm_weight, self.rms_norm_eps)
-
-    def noise_norm(self, x: torch.Tensor) -> torch.Tensor:
-        return _rms_norm(x, self._noise_norm_weight, self.rms_norm_eps)
 
     def noise_gate_at(self, start: float, end: float) -> torch.Tensor:
         """The weight of the state's noise term for a jump from ``start`` to
@@ -557,7 +563,10 @@ class FlashMapDraftModel(nn.Module):
             assert buf.stride(1) == self.head_dim and buf.stride(2) == 1
         device = self._ctx_kv_weight.device
         meta = torch.tensor(
-            [[k.data_ptr(), v.data_ptr(), k.stride(0), v.stride(0)] for k, v in buffers],
+            [
+                [k.data_ptr(), v.data_ptr(), k.stride(0), v.stride(0)]
+                for k, v in buffers
+            ],
             dtype=torch.int64,
             device=device,
         )
@@ -607,7 +616,9 @@ class FlashMapDraftModel(nn.Module):
             self.qk_norm_eps,
             is_neox_style=False,
         )
-        page_table = get_req_to_token_pool().req_to_token[forward_batch.req_pool_indices]
+        page_table = get_req_to_token_pool().req_to_token[
+            forward_batch.req_pool_indices
+        ]
         cache_seqlens = (forward_batch.seq_lens + 1).to(torch.int32)
         schedule = _cross_attention_schedule(
             (bsz, block_size, self.num_heads, self.head_dim), cache_seqlens, page_table
@@ -625,8 +636,9 @@ class FlashMapDraftModel(nn.Module):
     def _anchor_kv_impl(self, anchor_ids: torch.Tensor) -> torch.Tensor:
         """Every layer's context key/value row for each anchor token, before
         k-norm and RoPE (the fused write applies those)."""
-        anchor = self.anchor_proj(F.embedding(anchor_ids, self.embedding))
-        anchor = _rms_norm(anchor, self._anchor_norm_weight, self.rms_norm_eps)
+        anchor = self.anchor_norm(
+            self.anchor_proj(F.embedding(anchor_ids, self.embedding))
+        )
         return F.linear(anchor, self._ctx_kv_weight)
 
     def _draft_impl(
