@@ -389,10 +389,13 @@ class FlashMapDraftModel(nn.Module):
     def attach_shared_modules(self, *, embed_tokens: nn.Module, lm_head: nn.Module):
         """DSPARK hands over the target's embedding and LM head; everything the
         draft step reads from them is precomputed here, before sglang sizes its
-        KV pools."""
+        KV pools. A target with tied embeddings (Qwen3-4B) hands over its
+        embedding as the LM head; one without a head of its own falls back to
+        the embedding too."""
         self.embedding = embed_tokens.weight.detach()
         assert self.embedding.shape == (self.vocab_size, self.target_hidden_size)
-        self.prepare(lm_head.weight.detach())
+        head = getattr(lm_head, "weight", None)
+        self.prepare(self.embedding if head is None else head.detach())
 
     @torch.no_grad()
     def prepare(self, lm_head_weight: torch.Tensor) -> None:
