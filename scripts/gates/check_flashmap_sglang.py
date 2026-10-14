@@ -56,7 +56,8 @@ class FakePool:
 
 
 def target_vocab_weights(target: str):
-    """The target's (embed_tokens, lm_head) weights from its safetensors."""
+    """The target's (embed_tokens, lm_head) weights from its safetensors; a
+    target that ties them (Qwen3-4B) stores only the embedding."""
     if not os.path.isdir(target):
         from huggingface_hub import snapshot_download
 
@@ -66,6 +67,7 @@ def target_vocab_weights(target: str):
     ]
     out = []
     for name in ("model.embed_tokens.weight", "lm_head.weight"):
+        name = name if name in index else "model.embed_tokens.weight"
         with safe_open(
             os.path.join(target, index[name]), "pt", device="cuda"
         ) as handle:
