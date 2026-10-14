@@ -16,10 +16,15 @@ are renamed to the release's names here. The output directory holds:
   ranking of every token id by how often the target produces it, when the
   draft predicts over a restricted vocabulary (``draft_vocab_size``, 65536 by
   default: 99.95% of Qwen3's response tokens, at no measured acceptance cost,
-  while the draft's largest matmul shrinks by 2.3x).
+  while the draft's largest matmul shrinks by 2.3x). The ranking is the source
+  folder's ``draft_vocab.safetensors`` (key ``ids``, as the releases ship it)
+  unless ``--draft-vocab`` names another; a speculators-style ``d2t`` in the
+  source restricts the vocabulary to its tokens.
 
-    python -m specforge.export.flashmap --src FlashMap-Qwen3-8B \\
-        --output-dir FlashMap-Qwen3-8B-sglang --draft-vocab qwen3_8b_ranking.safetensors
+    python -m specforge.export.flashmap --src FlashMap-Qwen3-8B --output-dir FlashMap-Qwen3-8B-sglang
+
+``specforge export --to sglang`` routes FlashMap drafts here as well, from a
+release-layout folder or a SpecForge training checkpoint.
 """
 
 from __future__ import annotations
@@ -34,10 +39,35 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 ARCHITECTURE = "FlashMapDraftModel"
-# Qwen3's first unused token id; DSPARK fills block slots the draft never reads
-# with it.
-MASK_TOKEN_ID = 151669
 DEFAULT_DRAFT_VOCAB_SIZE = 65536
+# The ranking a release folder ships (key "ids": every token id, most frequent first).
+DRAFT_VOCAB_FILE = "draft_vocab.safetensors"
+_LAYER_WEIGHTS = (
+    tuple(
+        f"{module}.{param}"
+        for adaln in ("self_attn_adaln", "cross_attn_adaln", "mlp_adaln")
+        for module, param in (
+            (f"{adaln}.linear", "weight"),
+            (f"{adaln}.linear", "bias"),
+        )
+    )
+    + tuple(
+        f"{attn}.{name}.weight"
+        for attn in ("self_attn", "cross_attn")
+        for name in ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")
+    )
+    + ("mlp.fc1.weight", "mlp.fc1.bias", "mlp.fc2.weight", "mlp.fc2.bias")
+)
+_GLOBAL_WEIGHTS = (
+    "fc.weight", "hidden_norm.weight", "anchor_proj.weight", "anchor_proj.bias",
+    "anchor_norm.weight", "state_norm.weight", "noise_norm.weight", "noise_gate",
+    "x_embed.weight", "x_embed.bias", "time_embed.linear_1.weight",
+    "time_embed.linear_1.bias", "time_embed.linear_2.weight",
+    "time_embed.linear_2.bias", "jump_embed.linear_1.weight",
+    "jump_embed.linear_1.bias", "jump_embed.linear_2.weight",
+    "jump_embed.linear_2.bias", "final_adaln.linear.weight",
+    "final_adaln.linear.bias", "head.weight", "head.bias",
+)  # fmt: skip
 # Jump grids of the "decoding_error" time schedule at Qwen3's vocabulary size
 # (endpoints exactly 0 and 1), for DeepSpec sources, whose configs lack them.
 QWEN3_JUMP_GRIDS = {
@@ -154,17 +184,80 @@ def from_deepspec(src: str):
     return config, state
 
 
+def is_flashmap_folder(path: str) -> bool:
+    """Whether ``path`` is a release-layout FlashMap folder."""
+    try:
+        with open(os.path.join(path, "config.json")) as handle:
+            return json.load(handle).get("model_type") == "flashmap"
+    except (OSError, ValueError):
+        return False
+
+
 def load_flashmap(src: str):
     """``(release config, state dict)`` of a release folder or DeepSpec map."""
+    if not is_flashmap_folder(src):
+        return from_deepspec(src)
     with open(os.path.join(src, "config.json")) as handle:
         config = json.load(handle)
-    if config.get("model_type") != "flashmap":
-        return from_deepspec(src)
     with safe_open(os.path.join(src, "model.safetensors"), "pt") as handle:
         state = {name: handle.get_tensor(name) for name in handle.keys()}
     for target_weight in ("embed_tokens.weight", "lm_head.weight"):
         state.pop(target_weight, None)
     return config, state
+
+
+def check_weights(config: Dict, state: Dict) -> None:
+    """Every weight the sglang draft loads, and nothing else: a key the loader
+    did not expect would fail late, one it lacks would serve garbage."""
+    expected = set(_GLOBAL_WEIGHTS) | {
+        f"layers.{i}.{name}"
+        for i in range(int(config["num_hidden_layers"]))
+        for name in _LAYER_WEIGHTS
+    }
+    present = set(state) - {"draft_vocab_ids", "d2t", "t2d"}
+    missing, unexpected = sorted(expected - present), sorted(present - expected)
+    if missing or unexpected:
+        raise ValueError(
+            f"not a FlashMap state dict: missing {missing[:8]}, unexpected "
+            f"{unexpected[:8]}"
+        )
+
+
+def mask_token_id(config: Dict) -> int:
+    """A token id DSPARK may put in block slots the draft never reads: the
+    config's ``mask_token_id``, else the first id past the target tokenizer's
+    vocabulary (151669 for Qwen3), else the last embedding row."""
+    if config.get("mask_token_id") is not None:
+        return int(config["mask_token_id"])
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(config["target_model"])
+        if len(tokenizer) < int(config["vocab_size"]):
+            return len(tokenizer)
+    except Exception:  # no target_model, or not loadable offline
+        pass
+    return int(config["vocab_size"]) - 1
+
+
+def draft_vocab_ranking(src: str, state: Dict, path: Optional[str], vocab_size: int):
+    """Token ids for the draft vocabulary, most frequent first: ``path``'s or
+    the source folder's ranking of all ``vocab_size`` ids, a source ``d2t``'s
+    tokens (``target_id = i + d2t[i]``), or None (no ranking found)."""
+    d2t = state.pop("d2t", None)
+    state.pop("t2d", None)
+    if path is None and d2t is not None:
+        return torch.arange(d2t.numel()) + d2t.to(torch.int64)
+    if path is None and os.path.exists(os.path.join(src, DRAFT_VOCAB_FILE)):
+        path = os.path.join(src, DRAFT_VOCAB_FILE)
+    if path is None:
+        return None
+    ranking = load_file(path)["ids"].to(torch.int64)
+    if ranking.numel() != vocab_size or not torch.equal(
+        ranking.sort().values, torch.arange(vocab_size)
+    ):
+        raise ValueError(f"{path} is not a ranking of all {vocab_size} token ids")
+    return ranking
 
 
 def sglang_config(
@@ -194,7 +287,7 @@ def sglang_config(
         tie_word_embeddings=False,
         block_size=int(config["block_size"]),
         target_layer_ids=[int(i) for i in config["target_layer_ids"]],
-        mask_token_id=MASK_TOKEN_ID,
+        mask_token_id=mask_token_id(config),
         markov_rank=1,
         markov_head_type="vanilla",
         sample_from_anchor=True,
@@ -219,17 +312,17 @@ def export_flashmap_to_sglang(
     """Write an sglang FlashMap draft directory; returns ``output_dir``.
 
     ``draft_vocab`` is a safetensors file whose ``ids`` rank every token id,
-    most frequent first; without one the draft keeps the full vocabulary."""
+    most frequent first (default: the source folder's ``draft_vocab.safetensors``);
+    the draft predicts over the top ``draft_vocab_size`` (0: every token, as
+    also without any ranking)."""
     config, state = load_flashmap(src)
     vocab_size = int(config["vocab_size"])
-    if draft_vocab is None:
+    ranking = draft_vocab_ranking(src, state, draft_vocab, vocab_size)
+    check_weights(config, state)
+    if ranking is None:
         draft_vocab_size = 0
     if draft_vocab_size:
-        assert 0 < draft_vocab_size <= vocab_size, draft_vocab_size
-        ranking = load_file(draft_vocab)["ids"].to(torch.int64)
-        assert ranking.numel() == vocab_size and torch.equal(
-            ranking.sort().values, torch.arange(vocab_size)
-        ), f"{draft_vocab} is not a ranking of all {vocab_size} token ids"
+        draft_vocab_size = min(draft_vocab_size, ranking.numel())
         state["draft_vocab_ids"] = ranking
     if max_positions is None:
         max_positions = int(config.get("max_position_embeddings") or 40960)
@@ -253,15 +346,20 @@ def export_flashmap_to_sglang(
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--src", required=True, help="FlashMap release folder")
+    parser.add_argument(
+        "--src", required=True, help="FlashMap release folder (or DeepSpec map)"
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
         "--draft-vocab",
-        help="safetensors file ranking every token id (key 'ids'); "
-        "omit to draft over the full vocabulary",
+        help="safetensors file ranking every token id (key 'ids'); default: "
+        f"<src>/{DRAFT_VOCAB_FILE} if present",
     )
     parser.add_argument(
-        "--draft-vocab-size", type=int, default=DEFAULT_DRAFT_VOCAB_SIZE
+        "--draft-vocab-size",
+        type=int,
+        default=DEFAULT_DRAFT_VOCAB_SIZE,
+        help="draft over the ranking's top k tokens; 0: the full vocabulary",
     )
     parser.add_argument(
         "--num-steps", type=int, default=1, help="default jumps per draft"

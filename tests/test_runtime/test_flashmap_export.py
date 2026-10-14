@@ -16,9 +16,10 @@ H, D, LAYERS, VOCAB = 8, 16, 2, 151936
 
 def _deepspec_checkpoint(path):
     g = torch.Generator().manual_seed(0)
-    rand = lambda *shape: torch.randn(*shape, generator=g).to(
-        torch.bfloat16
-    )  # noqa: E731
+
+    def rand(*shape):
+        return torch.randn(*shape, generator=g).to(torch.bfloat16)
+
     state = {
         "embed_tokens.weight": rand(4, H),
         "lm_head.weight": rand(4, H),
