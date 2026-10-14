@@ -20,8 +20,8 @@ argmax). Drafted indices of a restricted vocabulary map back to token ids in
 the graph too, and the logits rejection sampling reads stay over the full
 vocabulary (-inf outside the draft vocabulary).
 
-``FLASHMAP_FUSED_SAMPLER=1`` (opt-in; its kernel is unit-tested but not yet
-benchmarked in a server) samples with one kernel instead: each greedy row's
+``FLASHMAP_FUSED_SAMPLER=1`` (opt-in, measured on Qwen3-8B only) samples with
+one kernel instead: each greedy row's
 argmax, each other row Gumbel-max-sampled at its temperature with in-kernel
 Philox noise, so there is no noise buffer, and the full-vocabulary logits are
 scattered only when DSPARK reads them for a sampling batch, so greedy batches
