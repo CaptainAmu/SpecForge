@@ -350,6 +350,104 @@ def create_dflash_block_mask(
     )
 
 
+def sample_anchor_positions(
+    seq_len: int,
+    loss_mask: torch.Tensor,
+    device: torch.device,
+    *,
+    num_anchors: int,
+    max_valid_anchors: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sample up to ``num_anchors`` anchors per row whose clean token and first
+    target are supervised; returns sorted anchors and their keep mask."""
+
+    num_candidates = max(seq_len - 1, 0)
+    valid = (loss_mask[:, :num_candidates] > 0.5) & (
+        loss_mask[:, 1 : num_candidates + 1] > 0.5
+    )
+    valid_counts = valid.sum(dim=1)
+    if max_valid_anchors is None:
+        # Direct model callers may supply an already-device-resident mask.
+        # Training strategies pass the CPU-computed value and avoid this
+        # synchronizing fallback on CUDA.
+        max_valid_anchors = int(valid_counts.max().item())
+    width = min(num_anchors, max(0, int(max_valid_anchors)))
+    if width == 0:
+        raise ValueError(
+            "DFlash-family training requires two consecutive supervised tokens"
+        )
+
+    random_values = torch.rand(valid.shape, device=device)
+    random_values.masked_fill_(~valid, 2.0)
+    candidates = random_values.argsort(dim=1)[:, :width]
+    keep_mask = torch.arange(width, device=device).unsqueeze(0) < valid_counts.clamp(
+        max=width
+    ).unsqueeze(1)
+
+    sentinel = valid.shape[1]
+    anchors = torch.where(
+        keep_mask,
+        candidates,
+        torch.full_like(candidates, sentinel),
+    )
+    anchors = anchors.sort(dim=1).values
+    keep_mask = anchors < sentinel
+    return torch.where(keep_mask, anchors, 0), keep_mask
+
+
+def build_block_labels(
+    input_ids: torch.Tensor,
+    loss_mask: torch.Tensor,
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Labels of blocks drafting the ``block_size`` tokens after each anchor:
+    ``(target_ids, eval_mask, safe_label_indices)``. ``eval_mask`` is the
+    contiguous supervised prefix of each kept block."""
+
+    seq_len = input_ids.shape[1]
+    device = input_ids.device
+    label_offsets = torch.arange(1, block_size + 1, device=device).view(1, 1, -1)
+    label_indices = anchor_positions.unsqueeze(-1) + label_offsets
+    safe_label_indices = label_indices.clamp(max=seq_len - 1)
+    safe_label_indices = torch.where(
+        block_keep_mask.unsqueeze(-1),
+        safe_label_indices,
+        torch.zeros_like(safe_label_indices),
+    )
+    target_ids = torch.gather(
+        input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
+        2,
+        safe_label_indices,
+    )
+
+    target_valid = label_indices < seq_len
+    target_loss_mask = torch.gather(
+        loss_mask.unsqueeze(1).expand(-1, label_indices.size(1), -1),
+        2,
+        safe_label_indices,
+    )
+    eval_mask = target_valid & (target_loss_mask > 0.5)
+    eval_mask = eval_mask & block_keep_mask.unsqueeze(-1)
+    eval_mask = eval_mask.to(torch.int32).cumprod(dim=-1).bool()
+    return target_ids, eval_mask, safe_label_indices
+
+
+def slot_decay_weights(
+    eval_mask: torch.Tensor, block_size: int, loss_decay_gamma: Optional[float]
+) -> torch.Tensor:
+    """``eval_mask`` weighted by ``exp(-k / gamma)`` over the slot index ``k``
+    (no decay when ``gamma`` is None or not positive)."""
+
+    loss_weight_mask = eval_mask.to(torch.float32)
+    if loss_decay_gamma is not None and loss_decay_gamma > 0:
+        positions = torch.arange(block_size, device=eval_mask.device).view(1, 1, -1)
+        decay_weights = torch.exp(-positions.float() / float(loss_decay_gamma))
+        loss_weight_mask = loss_weight_mask * decay_weights
+    return loss_weight_mask
+
+
 class OnlineDFlashModel(nn.Module):
     """DFlash online training wrapper with DFlash and D-PACE losses."""
 
@@ -451,38 +549,13 @@ class OnlineDFlashModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Sample anchors whose clean token and first target are supervised."""
 
-        num_candidates = max(seq_len - 1, 0)
-        valid = (loss_mask[:, :num_candidates] > 0.5) & (
-            loss_mask[:, 1 : num_candidates + 1] > 0.5
+        return sample_anchor_positions(
+            seq_len,
+            loss_mask,
+            device,
+            num_anchors=self.num_anchors,
+            max_valid_anchors=max_valid_anchors,
         )
-        valid_counts = valid.sum(dim=1)
-        if max_valid_anchors is None:
-            # Direct model callers may supply an already-device-resident mask.
-            # Training strategies pass the CPU-computed value and avoid this
-            # synchronizing fallback on CUDA.
-            max_valid_anchors = int(valid_counts.max().item())
-        width = min(self.num_anchors, max(0, int(max_valid_anchors)))
-        if width == 0:
-            raise ValueError(
-                "DFlash-family training requires two consecutive supervised tokens"
-            )
-
-        random_values = torch.rand(valid.shape, device=device)
-        random_values.masked_fill_(~valid, 2.0)
-        candidates = random_values.argsort(dim=1)[:, :width]
-        keep_mask = torch.arange(width, device=device).unsqueeze(
-            0
-        ) < valid_counts.clamp(max=width).unsqueeze(1)
-
-        sentinel = valid.shape[1]
-        anchors = torch.where(
-            keep_mask,
-            candidates,
-            torch.full_like(candidates, sentinel),
-        )
-        anchors = anchors.sort(dim=1).values
-        keep_mask = anchors < sentinel
-        return torch.where(keep_mask, anchors, 0), keep_mask
 
     def _create_position_ids(self, anchor_positions: torch.Tensor) -> torch.Tensor:
         """Create absolute position IDs for parallel draft blocks."""
@@ -2153,47 +2226,15 @@ class OnlineDSparkModel(OnlineDFlashModel):
         anchor_positions: torch.Tensor,
         block_keep_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        seq_len = input_ids.shape[1]
-        device = input_ids.device
-        label_offsets = torch.arange(1, self.block_size + 1, device=device).view(
-            1, 1, -1
+        return build_block_labels(
+            input_ids, loss_mask, anchor_positions, block_keep_mask, self.block_size
         )
-        label_indices = anchor_positions.unsqueeze(-1) + label_offsets
-        safe_label_indices = label_indices.clamp(max=seq_len - 1)
-        safe_label_indices = torch.where(
-            block_keep_mask.unsqueeze(-1),
-            safe_label_indices,
-            torch.zeros_like(safe_label_indices),
-        )
-        target_ids = torch.gather(
-            input_ids.unsqueeze(1).expand(-1, anchor_positions.size(1), -1),
-            2,
-            safe_label_indices,
-        )
-
-        target_valid = label_indices < seq_len
-        target_loss_mask = torch.gather(
-            loss_mask.unsqueeze(1).expand(-1, label_indices.size(1), -1),
-            2,
-            safe_label_indices,
-        )
-        eval_mask = target_valid & (target_loss_mask > 0.5)
-        eval_mask = eval_mask & block_keep_mask.unsqueeze(-1)
-        eval_mask = eval_mask.to(torch.int32).cumprod(dim=-1).bool()
-        return target_ids, eval_mask, safe_label_indices
 
     def _dspark_loss_weight_mask(
         self,
         eval_mask: torch.Tensor,
     ) -> torch.Tensor:
-        loss_weight_mask = eval_mask.to(torch.float32)
-        if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
-            positions = torch.arange(self.block_size, device=eval_mask.device).view(
-                1, 1, -1
-            )
-            decay_weights = torch.exp(-positions.float() / float(self.loss_decay_gamma))
-            loss_weight_mask = loss_weight_mask * decay_weights
-        return loss_weight_mask
+        return slot_decay_weights(eval_mask, self.block_size, self.loss_decay_gamma)
 
     def _aligned_target_hidden(
         self,
