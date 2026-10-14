@@ -2,6 +2,8 @@
 """FlashMap draft model, its two-stage training wrapper, and its registration."""
 
 import copy
+import json
+import os
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -11,10 +13,12 @@ from torch import nn
 
 from specforge.algorithms.flashmap.model import BOUNDARY, DIAGONAL, OnlineFlashMapModel
 from specforge.algorithms.flashmap.providers import (
+    _objective_settings,
     build_training_model,
     initialize_map_from_flow,
     populate_target_defaults,
 )
+from specforge.export.checkpoint_io import materialize_draft
 from specforge.modeling.auto import AutoDraftModel
 from specforge.modeling.draft import resolve_draft
 from specforge.modeling.draft.flashmap import (
@@ -131,6 +135,28 @@ class FlashMapModelTest(unittest.TestCase):
         for name, tensor in loaded.state_dict().items():
             torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
 
+    def test_end_time_embedding_starts_like_the_reference(self):
+        draft = FlashMapDraftModel(tiny_config())
+        # nn.Linear's own init on the first layer (the reference adds this
+        # embedding after initializing the network), zeros on the output.
+        self.assertGreater(float(draft.jump_embed.linear_1.weight.std()), 0.05)
+        self.assertFalse(draft.jump_embed.linear_2.weight.any())
+        self.assertFalse(draft.jump_embed.linear_2.bias.any())
+        self.assertLess(float(draft.x_embed.weight.std()), 0.03)
+
+    def test_flow_checkpoint_exports_as_a_flow(self):
+        flow = randomize(FlashMapDraftModel(tiny_config(flow_map=False)))
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "draft.json")
+            payload = tiny_config().to_dict()
+            payload["architectures"] = ["FlashMapDraftModel"]
+            with open(config_path, "w") as handle:
+                json.dump(payload, handle)
+            state = {"draft_state_dict": flow.state_dict()}
+            exported = materialize_draft(state, config_path)
+        self.assertFalse(exported.config.flow_map)
+        self.assertFalse(hasattr(exported, "jump_embed"))
+
     def test_jump_grids_match_the_released_qwen3_schedule(self):
         grids = FlashMapConfig().jump_grids
         self.assertEqual([0.0, 1.0], grids["1"])
@@ -220,6 +246,44 @@ class FlashMapModelTest(unittest.TestCase):
         self.assertTrue(torch.equal(s[kind == DIAGONAL], t[kind == DIAGONAL]))
         self.assertTrue(torch.all((s <= u) & (u <= t)))
 
+    def test_map_split_is_drawn_over_the_padded_batch(self):
+        flow = randomize(FlashMapDraftModel(tiny_config(flow_map=False)))
+        draft = FlashMapDraftModel(tiny_config())
+        initialize_map_from_flow(draft, flow)
+        model = wrapper(draft, stage="map", flow=flow, num_anchors=64)
+        shapes = []
+        sample = model._sample_map_times
+
+        def recording(shape, device):
+            shapes.append(tuple(shape))
+            return sample(shape, device)
+
+        model._sample_map_times = recording
+        model(*batch())
+        # Few valid anchors per row, but the split covers bsz * num_anchors,
+        # so short rows still get drafting-jump blocks.
+        self.assertEqual([(2, 64)], shapes)
+
+    def test_padded_blocks_carry_no_weight(self):
+        draft = randomize(FlashMapDraftModel(tiny_config(flow_map=False)))
+        model = wrapper(draft)
+        input_ids, hidden_states, loss_mask = batch()
+        anchors = torch.tensor([[5, 9, 12], [2, 0, 0]])
+        keep = torch.tensor([[True, True, True], [True, False, False]])
+        results = []
+        for padded in (0, 7):
+            model._sample_anchor_positions = lambda *args, padded=padded, **kwargs: (
+                torch.where(keep, anchors, padded),
+                keep,
+            )
+            torch.manual_seed(5)
+            _, _, metrics = model(input_ids, hidden_states, loss_mask)
+            results.append(metrics["loss_terms"])
+        torch.testing.assert_close(results[0][0], results[1][0])
+        # Kept blocks: 4 slots each with the decay weights; padded: none.
+        expected = 4 * float(torch.exp(-torch.arange(4.0) / 7.0).sum())
+        self.assertAlmostEqual(float(results[0][1]), expected, places=4)
+
     def test_stage_and_network_must_agree(self):
         with self.assertRaisesRegex(ValueError, "flow_map"):
             wrapper(FlashMapDraftModel(tiny_config()))
@@ -269,6 +333,18 @@ class FlashMapProviderTest(unittest.TestCase):
         draft = FlashMapDraftModel(tiny_config())
         with self.assertRaisesRegex(ValueError, "flashmap_flow_checkpoint"):
             build_training_model(config, draft, tiny_config(), None, None)
+
+    def test_flashmap_objective_defaults(self):
+        training = SimpleNamespace(
+            flashmap_stage="map", loss_decay_gamma=None, num_anchors=512
+        )
+        with self.assertLogs("specforge.algorithms.flashmap.providers", "WARNING"):
+            num_anchors, gamma = _objective_settings(training)
+        self.assertEqual((512, 7.0), (num_anchors, gamma))
+        training = SimpleNamespace(
+            flashmap_stage="flow", loss_decay_gamma=0.0, num_anchors=512
+        )
+        self.assertEqual((512, 0.0), _objective_settings(training))
 
     def test_map_init_rejects_a_mismatched_flow(self):
         draft = FlashMapDraftModel(tiny_config())

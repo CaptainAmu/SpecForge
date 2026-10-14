@@ -30,6 +30,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 from transformers import initialization as init
 from transformers.integrations.flex_attention import compile_friendly_flex_attention
 
+from .flex_attention_backend import flex_attention_backend
 from .registry import register_draft
 
 AttentionMask = Union[BlockMask, torch.Tensor, None]
@@ -241,11 +242,12 @@ def timestep_embedding(
 
 
 def flex_kernel_options() -> dict:
-    """Pin the general Triton Flex Attention kernel, as DFlash training does:
-    AUTO may route short query batches to flex-decoding, whose configs can be
-    empty for a sparse block mask."""
+    """Flex Attention kernel options: ``SPECFORGE_FLEX_ATTENTION_BACKEND`` when
+    set, else the general Triton kernel, which DFlash training also pins
+    because AUTO may route short query batches to flex-decoding, whose configs
+    can be empty for a sparse block mask."""
     if torch.__version__ >= "2.11":
-        return {"BACKEND": "TRITON"}
+        return {"BACKEND": flex_attention_backend() or "TRITON"}
     return {"FORCE_USE_FLEX_ATTENTION": True}
 
 
@@ -275,6 +277,10 @@ def create_context_mask(
             anchor = anchor_positions[b, q_idx // block_size]
             return (kv_idx < anchor) | (kv_idx == anchor + offset)
 
+        kwargs = {}
+        if flex_attention_backend() == "FLASH":
+            # FLASH requires a minimum of this block size.
+            kwargs["BLOCK_SIZE"] = (256, 128)
         return create_block_mask(
             mask_mod,
             B=bsz,
@@ -282,6 +288,7 @@ def create_context_mask(
             Q_LEN=num_blocks * block_size,
             KV_LEN=2 * seq_len,
             device=anchor_positions.device,
+            **kwargs,
         )
     anchor = anchor_positions.repeat_interleave(block_size, dim=1).unsqueeze(-1)
     kv_idx = torch.arange(2 * seq_len, device=anchor_positions.device).view(1, 1, -1)
@@ -438,7 +445,10 @@ class FlashMapDecoderLayer(nn.Module):
 class FlashMapPreTrainedModel(PreTrainedModel):
     config_class = FlashMapConfig
     base_model_prefix = "flashmap"
-    _no_split_modules = ["FlashMapDecoderLayer"]
+    # One FSDP unit for the whole DiT: the cross-attention context is projected
+    # once per step (``project_context``, outside the layers' forward) and read
+    # by every evaluation, so a layer must not be a sharded unit of its own.
+    _no_split_modules = []
     _supports_sdpa = True
     _supports_flex_attn = True
 
@@ -449,6 +459,15 @@ class FlashMapPreTrainedModel(PreTrainedModel):
             # AdaLN modulations, the output head and the end-time embedding
             # start at zero: every block starts as the identity, the draft as
             # the uniform distribution, and a map as the flow it came from.
+            if getattr(module, "_flashmap_torch_init", False):
+                # nn.Linear's own init, which the end-time embedding's first
+                # layer keeps in the reference (it is added after the rest of
+                # the network is initialized).
+                init.kaiming_uniform_(module.weight, a=math.sqrt(5))
+                if module.bias is not None:
+                    bound = 1 / math.sqrt(module.in_features)
+                    init.uniform_(module.bias, -bound, bound)
+                return
             if getattr(module, "_flashmap_zero_init", False):
                 init.zeros_(module.weight)
             else:
@@ -500,6 +519,7 @@ class FlashMapDraftModel(FlashMapPreTrainedModel):
             self.jump_embed = FlashMapTimestepEmbedding(
                 config.cond_dim, config.time_embed_dim
             )
+            self.jump_embed.linear_1._flashmap_torch_init = True
             self.jump_embed.linear_2._flashmap_zero_init = True
         self.layers = nn.ModuleList(
             [FlashMapDecoderLayer(config) for _ in range(config.num_hidden_layers)]
@@ -510,6 +530,12 @@ class FlashMapDraftModel(FlashMapPreTrainedModel):
         self.head = nn.Linear(dim, target_hidden)
         self.head._flashmap_zero_init = True
         self.post_init()
+
+    @staticmethod
+    def adapt_config_to_checkpoint(config: FlashMapConfig, state_dict) -> None:
+        """A flow and its map share one draft config; the weights tell which a
+        checkpoint holds (only a map has the end-time embedding)."""
+        config.flow_map = any(key.startswith("jump_embed.") for key in state_dict)
 
     def freqs(self, position_ids: torch.Tensor) -> torch.Tensor:
         return rope_freqs(position_ids, self.head_dim, self.config.rope_theta)

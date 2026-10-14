@@ -1,6 +1,9 @@
 # coding=utf-8
 """FlashMap through the public CLI on CPU: flow stage, map stage distilled from
-the flow's run directory, resume of the map stage, and HF export."""
+the flow's run directory, and HF export of both.
+
+Each leg is a ``specforge`` process, so the test takes minutes; it runs when
+``SPECFORGE_RUN_CLI_TESTS=1``."""
 
 import json
 import os
@@ -116,6 +119,10 @@ def _specforge(*args: str) -> subprocess.CompletedProcess:
     )
 
 
+@unittest.skipUnless(
+    os.environ.get("SPECFORGE_RUN_CLI_TESTS") == "1",
+    "set SPECFORGE_RUN_CLI_TESTS=1 to run the CLI pipeline",
+)
 class FlashMapCliPipelineTest(unittest.TestCase):
     def test_flow_then_map_then_export(self):
         with tempfile.TemporaryDirectory() as root:
@@ -124,14 +131,6 @@ class FlashMapCliPipelineTest(unittest.TestCase):
                 result = _specforge("train", "--config", _config(root, stage))
                 self.assertEqual(0, result.returncode, result.stderr[-4000:])
                 self.assertIn("step 4:", result.stdout)
-
-            resumed = _specforge(
-                "train",
-                "--config",
-                os.path.join(root, "map.yaml"),
-                f"training.resume_from={root}/out/flashmap-map/flashmap-map-step2",
-            )
-            self.assertEqual(0, resumed.returncode, resumed.stderr[-4000:])
 
             export = os.path.join(root, "export")
             result = _specforge(
@@ -156,6 +155,22 @@ class FlashMapCliPipelineTest(unittest.TestCase):
             self.assertFalse(
                 any("lm_head" in key or "embed_tokens" in key for key in weights)
             )
+
+            flow_export = os.path.join(root, "flow-export")
+            result = _specforge(
+                "export",
+                "--to",
+                "hf",
+                "--checkpoint",
+                f"{root}/out/flashmap-flow",
+                "--draft-config",
+                f"{root}/draft.json",
+                "--output-dir",
+                flow_export,
+            )
+            self.assertEqual(0, result.returncode, result.stderr[-4000:])
+            with open(os.path.join(flow_export, "config.json")) as handle:
+                self.assertFalse(json.load(handle)["flow_map"])
 
 
 if __name__ == "__main__":

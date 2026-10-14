@@ -12,7 +12,8 @@ eq. 23 and Algorithm 7): half the blocks train the diagonal ``delta_{t,t}``
 against the frozen flow's ``D_t``; the rest train a jump ``s -> t`` against
 two half-jumps of the current map under stop-gradient, with a fraction of them
 on the drafting jump ``(0, 1)``. The student starts as a copy of the flow plus
-a zero-initialized end-time embedding, so it starts as the flow.
+an end-time embedding with a zero output layer, so on the diagonal it starts as
+the flow.
 
 Anchor sampling, block labels and slot-decay weights are DFlash/DSpark's; the
 target embedding and lm_head are frozen, as for every DFlash-family wrapper.
@@ -21,7 +22,6 @@ target embedding and lm_head are frozen, as for every DFlash-family wrapper.
 from __future__ import annotations
 
 import math
-from functools import partial
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -29,8 +29,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from specforge.algorithms.common.dflash_family_model import (
-    OnlineDFlashModel,
-    OnlineDSparkModel,
+    build_block_labels,
+    sample_anchor_positions,
+    slot_decay_weights,
 )
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.modeling.draft.flashmap import (
@@ -48,13 +49,6 @@ NUM_TAU_BINS = 4
 class OnlineFlashMapModel(nn.Module):
     """FlashMap training forward for either stage; returns
     ``(loss, accuracy, metrics)`` like the DFlash-family wrappers."""
-
-    # DFlash's anchor sampler and DSpark's labels and slot-decay weights read
-    # only num_anchors, block_size and loss_decay_gamma: FlashMap shares them
-    # (a block's 16 slots draft the tokens after its anchor, as in DSpark).
-    _sample_anchor_positions = OnlineDFlashModel._sample_anchor_positions
-    _build_block_labels = OnlineDSparkModel._build_dspark_labels_and_mask
-    _loss_weights = OnlineDSparkModel._dspark_loss_weight_mask
 
     def __init__(
         self,
@@ -116,6 +110,20 @@ class OnlineFlashMapModel(nn.Module):
     # ------------------------------------------------------------------
     # Shared pieces
     # ------------------------------------------------------------------
+
+    def _sample_anchor_positions(self, seq_len, loss_mask, device, max_valid_anchors):
+        # DFlash's anchor sampler; a block's slots then draft the tokens after
+        # its anchor, labelled and decay-weighted as in DSpark.
+        return sample_anchor_positions(
+            seq_len,
+            loss_mask,
+            device,
+            num_anchors=self.num_anchors,
+            max_valid_anchors=max_valid_anchors,
+        )
+
+    def _loss_weights(self, eval_mask: torch.Tensor) -> torch.Tensor:
+        return slot_decay_weights(eval_mask, self.block_size, self.loss_decay_gamma)
 
     def _block_context(self, model, input_ids, hidden_states, anchor_positions):
         """Cross-attention keys/values of ``model`` over every position, and
@@ -371,7 +379,15 @@ class OnlineFlashMapModel(nn.Module):
     def _map_forward(self, input_ids, hidden_states, anchor_positions, labels):
         target_ids, eval_mask, position_ids = labels
         bsz, num_blocks = anchor_positions.shape
-        kind, s, u, t = self._sample_map_times((bsz, num_blocks), input_ids.device)
+        # Categories and times are drawn for every anchor slot of the padded
+        # batch, bsz * num_anchors, as DeepSpec does: a row with few valid
+        # anchors still gets its share of drafting-jump blocks.
+        kind, s, u, t = (
+            draws[:, :num_blocks]
+            for draws in self._sample_map_times(
+                (bsz, max(self.num_anchors, num_blocks)), input_ids.device
+            )
+        )
         # One interpolant per block, at its start time.
         state = self._interpolant(target_ids, self._per_slot(s).float(), torch.float32)
         with torch.no_grad():
@@ -447,16 +463,19 @@ class OnlineFlashMapModel(nn.Module):
         loss_mask: torch.Tensor,
         max_valid_anchors: Optional[int] = None,
         collect_detailed_metrics: bool = True,
+        selector_loss_alpha: Optional[float] = None,
+        target_last_hidden_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
-        del collect_detailed_metrics
+        # The DFlash step's selector weight and teacher states do not apply.
+        del collect_detailed_metrics, selector_loss_alpha, target_last_hidden_states
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
             input_ids.shape[1],
             loss_mask,
             input_ids.device,
             max_valid_anchors=max_valid_anchors,
         )
-        target_ids, eval_mask, _ = self._build_block_labels(
-            input_ids, loss_mask, anchor_positions, block_keep_mask
+        target_ids, eval_mask, _ = build_block_labels(
+            input_ids, loss_mask, anchor_positions, block_keep_mask, self.block_size
         )
         offsets = torch.arange(1, self.block_size + 1, device=input_ids.device)
         position_ids = (anchor_positions.unsqueeze(-1) + offsets).flatten(1)

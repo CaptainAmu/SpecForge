@@ -9,6 +9,7 @@ Both consume DFlash's features (the target's hidden states at
 
 from __future__ import annotations
 
+import logging
 from functools import partial
 
 from specforge.algorithms.common.defaults import (
@@ -32,6 +33,7 @@ from specforge.algorithms.common.providers import (
     ServerStreamingProvider,
     StepProvider,
     TargetDerivedDraftDefaults,
+    checkpoint_key_fingerprint,
     make_registration,
 )
 from specforge.algorithms.contracts import (
@@ -44,7 +46,14 @@ from specforge.algorithms.contracts import (
 )
 from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
+logger = logging.getLogger(__name__)
+
 ALGORITHM_NAME = "flashmap"
+# The released recipe's slot decay and blocks per sequence. ``loss_decay_gamma:
+# null`` means this gamma for FlashMap (0 disables the decay).
+DEFAULT_LOSS_DECAY_GAMMA = 7.0
+RECIPE_NUM_ANCHORS = {"flow": 512, "map": 128}
+SHARED_NUM_ANCHORS_DEFAULT = 512
 DRAFT_ARCHITECTURE = "FlashMapDraftModel"
 # Draft keys a map has and its flow does not; they start from their init.
 MAP_ONLY_KEY_PREFIXES = ("jump_embed.", "noise_norm.", "noise_gate")
@@ -99,6 +108,12 @@ def resume_contract(config, draft_model, training_model):
                 "flashmap_antithetic_sampling": training_model.antithetic_sampling,
             }
         )
+        flow = getattr(training_model, "flow", None)
+        if flow is not None:
+            # Resuming against a different teacher is refused.
+            contract["flashmap_flow_fingerprint"] = checkpoint_key_fingerprint(
+                flow, flow.state_dict().keys()
+            )
     return contract
 
 
@@ -153,6 +168,7 @@ def _load_flow(config, draft_config):
         trust_remote_code=config.model.trust_remote_code,
     )
     flow = flow.to(device=_device(), dtype=_torch_dtype(config))
+    logger.info("FlashMap map stage: frozen flow teacher from %s", source)
     return flow.requires_grad_(False).eval()
 
 
@@ -170,6 +186,49 @@ def initialize_map_from_flow(draft_model, flow) -> None:
             "flow checkpoint does not match the map architecture: "
             f"unexpected={sorted(unexpected)}, missing={sorted(missing)}"
         )
+
+
+def _objective_settings(training):
+    """``(num_anchors, loss_decay_gamma)``, with FlashMap's own defaults where
+    the shared DFlash-family fields would silently train differently."""
+    stage = training.flashmap_stage
+    gamma = training.loss_decay_gamma
+    if gamma is None:
+        gamma = DEFAULT_LOSS_DECAY_GAMMA
+        logger.info("FlashMap: training.loss_decay_gamma=null -> %s", gamma)
+    num_anchors = int(training.num_anchors)
+    recipe = RECIPE_NUM_ANCHORS[stage]
+    if num_anchors == SHARED_NUM_ANCHORS_DEFAULT and recipe != num_anchors:
+        logger.warning(
+            "FlashMap %s stage with training.num_anchors=%d; the released "
+            "recipe uses %d (each map step evaluates the network three times on "
+            "vocabulary-sized states). Set training.num_anchors explicitly.",
+            stage,
+            num_anchors,
+            recipe,
+        )
+    return num_anchors, gamma
+
+
+def _decorrelate_ranks(seed: int) -> None:
+    """Give each data-parallel rank its own anchors, times and noise.
+
+    ``accelerate.set_seed`` seeds every rank alike, and FlashMap draws all of
+    them on the training device, so equally shaped batches would get equal
+    draws. The device generator is reseeded with ``seed + rank``; the per-rank
+    RNG state is checkpointed, so a resume continues each rank's stream.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from specforge.algorithms.model_providers import _device
+
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    device = _device()
+    if device.type == "cpu":
+        torch.manual_seed(seed + rank)
+    else:
+        getattr(torch, device.type).manual_seed(seed + rank)
 
 
 def build_training_model(config, draft_model, draft_config, target_config, tokenizer):
@@ -209,6 +268,7 @@ def build_training_model(config, draft_model, draft_config, target_config, token
         trust_remote_code=config.model.trust_remote_code,
     )
     training = config.training
+    num_anchors, loss_decay_gamma = _objective_settings(training)
     model = OnlineFlashMapModel(
         draft_model,
         target_parts.lm_head,
@@ -216,13 +276,14 @@ def build_training_model(config, draft_model, draft_config, target_config, token
         stage=stage,
         flow=flow,
         attention_backend=training.attention_backend,
-        num_anchors=training.num_anchors,
-        loss_decay_gamma=training.loss_decay_gamma,
+        num_anchors=num_anchors,
+        loss_decay_gamma=loss_decay_gamma,
         objective_chunk_blocks=training.objective_chunk_blocks,
         diagonal_fraction=training.flashmap_diagonal_fraction,
         boundary_prob=training.flashmap_boundary_prob,
         antithetic_sampling=training.flashmap_antithetic_sampling,
     ).to(device=_device(), dtype=_torch_dtype(config))
+    _decorrelate_ranks(int(training.seed))
     return AlgorithmModelParts(
         model=model, capture_layers=list(draft_model.target_layer_ids)
     )
