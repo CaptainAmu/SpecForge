@@ -54,6 +54,67 @@ class TestLearningRateScheduler(unittest.TestCase):
         state.pop("lr_scheduler_type")
         self.assertEqual(state.get("lr_scheduler_type", "cosine"), "cosine")
 
+    def test_wsd_holds_the_peak_then_anneals_over_the_decay_ratio(self):
+        model, optimizer = _optimizer(scheduler="wsd", total_steps=10, warmup_ratio=0.2)
+        observed = []
+        for _ in range(10):
+            observed.append(optimizer.get_learning_rate())
+            model.weight.grad = torch.ones_like(model.weight)
+            optimizer.step()
+        # 2 warmup steps; the post-warmup schedule holds for 6 steps, then
+        # anneals over 2, reaching zero after the last step.
+        self.assertAlmostEqual(observed[0], 5e-4)
+        self.assertEqual(observed[1:9], [1e-3] * 8)
+        self.assertAlmostEqual(observed[9], 5e-4)
+
+    def test_wsd_resumes_mid_schedule(self):
+        model, optimizer = _optimizer(scheduler="wsd", total_steps=10)
+        for _ in range(9):
+            model.weight.grad = torch.ones_like(model.weight)
+            optimizer.step()
+        _other, resumed = _optimizer(scheduler="wsd", total_steps=10)
+        resumed.scheduler.load_state_dict(optimizer.scheduler.state_dict())
+        self.assertAlmostEqual(
+            resumed.get_learning_rate(), optimizer.get_learning_rate()
+        )
+        optimizer.scheduler.step()
+        resumed.scheduler.step()
+        self.assertAlmostEqual(
+            resumed.get_learning_rate(), optimizer.get_learning_rate()
+        )
+
+
+class TestAdamWOptions(unittest.TestCase):
+    def _model(self):
+        return torch.nn.Sequential(
+            torch.nn.Embedding(8, 4),
+            torch.nn.Linear(4, 4),
+            torch.nn.LayerNorm(4),
+        )
+
+    def test_decay_matrices_only_skips_biases_norms_and_embeddings(self):
+        model = self._model()
+        optimizer = BF16Optimizer(
+            model,
+            lr=1e-3,
+            total_steps=4,
+            weight_decay=0.1,
+            decay_matrices_only=True,
+            betas=(0.9, 0.95),
+        )
+        decay, no_decay = optimizer.optimizer.param_groups
+        self.assertEqual(0.1, decay["weight_decay"])
+        self.assertEqual((0.9, 0.95), decay["betas"])
+        self.assertEqual([(4, 4)], [tuple(p.shape) for p in decay["params"]])
+        self.assertEqual(0.0, no_decay["weight_decay"])
+        self.assertEqual(4, len(no_decay["params"]))
+
+    def test_no_decay_keeps_the_single_group_layout(self):
+        optimizer = BF16Optimizer(
+            self._model(), lr=1e-3, total_steps=4, decay_matrices_only=True
+        )
+        self.assertEqual(1, len(optimizer.optimizer.param_groups))
+
 
 if __name__ == "__main__":
     unittest.main()

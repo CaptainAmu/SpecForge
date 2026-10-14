@@ -904,8 +904,16 @@ class TrainingConfig(StrictConfigModel):
     accumulation_steps: int = Field(default=1, gt=0)
     fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
     learning_rate: float = Field(default=1e-4, gt=0.0)
-    lr_scheduler: Literal["cosine", "constant"] = "cosine"
+    #: ``wsd`` (warmup-stable-decay) holds the peak rate, then anneals over the
+    #: last ``lr_decay_ratio`` of the optimizer steps.
+    lr_scheduler: Literal["cosine", "constant", "wsd"] = "cosine"
+    lr_decay_ratio: float = Field(default=0.2, gt=0.0, le=1.0)
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
+    #: AdamW betas, and decoupled weight decay applied to weight matrices only
+    #: (biases, norm gains and embedding tables are never decayed).
+    adam_beta1: float = Field(default=0.9, ge=0.0, lt=1.0)
+    adam_beta2: float = Field(default=0.999, ge=0.0, lt=1.0)
+    weight_decay: float = Field(default=0.0, ge=0.0)
     max_grad_norm: float = Field(default=0.5, gt=0.0)
     #: Keep FP32 Adam masters and moments on CPU while the trainable draft
     #: remains on the accelerator.

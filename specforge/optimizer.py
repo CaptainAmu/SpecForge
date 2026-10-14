@@ -4,7 +4,11 @@ import math
 import torch
 import torch.distributed as dist
 
-from specforge.lr_scheduler import ConstantWarmupLR, CosineAnnealingWarmupLR
+from specforge.lr_scheduler import (
+    ConstantWarmupLR,
+    CosineAnnealingWarmupLR,
+    StableDecayWarmupLR,
+)
 from specforge.utils import print_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -49,6 +53,9 @@ class BF16Optimizer:
         warmup_ratio=0.015,
         lr_scheduler="cosine",
         offload_master=False,
+        betas=(0.9, 0.999),
+        decay_matrices_only=False,
+        lr_decay_ratio=0.2,
     ):
         # defaults copied from EAGLE traineagle3 ds_config.json
         self.model = model
@@ -73,9 +80,10 @@ class BF16Optimizer:
             else None
         )
         self.optimizer = torch.optim.AdamW(
-            self.fp32_params,
+            self._param_groups(weight_decay, decay_matrices_only),
             lr=lr,
             weight_decay=weight_decay,
+            betas=tuple(betas),
             fused=self._adamw_fused,
         )
         self.last_grad_norm = None
@@ -84,6 +92,7 @@ class BF16Optimizer:
         scheduler_types = {
             "constant": ConstantWarmupLR,
             "cosine": CosineAnnealingWarmupLR,
+            "wsd": StableDecayWarmupLR,
         }
         if lr_scheduler not in scheduler_types:
             raise ValueError(
@@ -91,11 +100,37 @@ class BF16Optimizer:
                 f"expected one of {sorted(scheduler_types)}"
             )
         self.lr_scheduler_type = lr_scheduler
+        scheduler_kwargs = (
+            {"decay_ratio": lr_decay_ratio} if lr_scheduler == "wsd" else {}
+        )
         self.scheduler = scheduler_types[lr_scheduler](
             self.optimizer,
             total_steps=total_steps,
             warmup_steps=int(warmup_ratio * total_steps),
+            **scheduler_kwargs,
         )
+
+    def _param_groups(self, weight_decay, decay_matrices_only):
+        """With ``decay_matrices_only``, biases, norm gains and embedding tables
+        are not decayed. Without decay there is one group, the layout every
+        earlier checkpoint was saved with."""
+        if weight_decay == 0 or not decay_matrices_only:
+            return self.fp32_params
+        embeddings = {
+            id(module.weight)
+            for module in self.model.modules()
+            if isinstance(module, torch.nn.Embedding)
+        }
+        decay, no_decay = [], []
+        for param, master in zip(self.model_params, self.fp32_params):
+            if param.ndim < 2 or id(param) in embeddings:
+                no_decay.append(master)
+            else:
+                decay.append(master)
+        return [
+            {"params": decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
 
     def configure_grad_norm_reduction(
         self, *, process_group=None, enabled: bool = True

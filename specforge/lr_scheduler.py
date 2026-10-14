@@ -1,6 +1,8 @@
+import math
 from warnings import warn
 
 from torch.optim.lr_scheduler import CosineAnnealingLR as _CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR as _LambdaLR
 from torch.optim.lr_scheduler import LRScheduler as _LRScheduler
 
 
@@ -147,4 +149,33 @@ class ConstantWarmupLR(_WarmupScheduler):
         super().__init__(optimizer, warmup_steps, base_scheduler, last_epoch=last_epoch)
 
 
-__all__ = ["ConstantWarmupLR", "CosineAnnealingWarmupLR"]
+class StableDecayWarmupLR(_WarmupScheduler):
+    """Warmup-stable-decay: linear warmup, then the peak rate, then a cosine
+    anneal to zero over the last ``decay_ratio`` of the steps.
+
+    Holding the peak keeps every checkpoint of the stable phase comparable and
+    spends the anneal only at the end.
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        total_steps: int,
+        warmup_steps: int = 0,
+        decay_ratio: float = 0.2,
+        last_epoch: int = -1,
+    ):
+        decay_steps = max(1, int(decay_ratio * total_steps))
+        stable_steps = max(0, total_steps - warmup_steps - decay_steps)
+
+        def factor(step: int) -> float:
+            if step < stable_steps:
+                return 1.0
+            progress = min(1.0, (step - stable_steps) / decay_steps)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        base_scheduler = _LambdaLR(optimizer, factor, last_epoch=last_epoch)
+        super().__init__(optimizer, warmup_steps, base_scheduler, last_epoch=last_epoch)
+
+
+__all__ = ["ConstantWarmupLR", "CosineAnnealingWarmupLR", "StableDecayWarmupLR"]
