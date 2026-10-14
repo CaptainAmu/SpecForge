@@ -55,21 +55,30 @@ class FakePool:
         return self.values[layer_id]
 
 
-def target_vocab_weights(target: str):
-    """The target's (embed_tokens, lm_head) weights from its safetensors."""
+def target_vocab_weights(target: str, device: str = "cuda"):
+    """The target's (embed_tokens, lm_head) weights from its safetensors. A
+    target that ties them (``tie_word_embeddings``, e.g. Qwen3-4B) may store
+    no ``lm_head.weight``: its embedding is the LM head."""
     if not os.path.isdir(target):
         from huggingface_hub import snapshot_download
 
         target = snapshot_download(target, allow_patterns=["*.json", "*.safetensors"])
-    index = json.load(open(os.path.join(target, "model.safetensors.index.json")))[
-        "weight_map"
-    ]
+    with open(os.path.join(target, "config.json")) as handle:
+        config = json.load(handle)
+    tied = bool(config.get("tie_word_embeddings", False))
+    index_path = os.path.join(target, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as handle:
+            files = json.load(handle)["weight_map"]
+    else:  # a single-file checkpoint
+        with safe_open(os.path.join(target, "model.safetensors"), "pt") as handle:
+            files = {name: "model.safetensors" for name in handle.keys()}
+    embed = "model.embed_tokens.weight"
+    head = embed if tied or "lm_head.weight" not in files else "lm_head.weight"
     out = []
-    for name in ("model.embed_tokens.weight", "lm_head.weight"):
-        with safe_open(
-            os.path.join(target, index[name]), "pt", device="cuda"
-        ) as handle:
-            out.append(handle.get_tensor(name))
+    for name in (embed, head):
+        with safe_open(os.path.join(target, files[name]), "pt", device=device) as f:
+            out.append(f.get_tensor(name))
     return out
 
 
