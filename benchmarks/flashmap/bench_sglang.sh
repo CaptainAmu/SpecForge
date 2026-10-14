@@ -23,7 +23,8 @@
 # temperature 1. Outputs stop at EOS or MAX_TOKENS (1024). Results: one JSON
 # line per cell in $OUT/results-<server>.jsonl; summary.py prints the table.
 # OUTPUT_DETAILS=1 also records every generated text (to compare servers' greedy
-# outputs with compare_outputs.py). GPU_LOCK=<file> holds an exclusive flock on it for each server's lifetime
+# outputs with compare_outputs.py); GREEDY_IDS=<n> saves the token ids of greedy
+# outputs for the first n prompts of each task (for check_greedy.py). GPU_LOCK=<file> holds an exclusive flock on it for each server's lifetime
 # (for GPUs shared under that protocol).
 set -uo pipefail
 
@@ -31,6 +32,7 @@ TARGET=${TARGET:?set TARGET (target model path or id)}
 PROMPTS=${PROMPTS:?set PROMPTS (directory of <task>.jsonl in custom format)}
 OUT=${OUT:-logs/flashmap_sglang}
 OUTPUT_DETAILS=${OUTPUT_DETAILS:-}
+GREEDY_IDS=${GREEDY_IDS:-}
 SERVERS=${SERVERS:-target=target}
 CELLS=${CELLS:-"gsm8k:1:16:0 humaneval:1:16:0 mt-bench:1:16:0 gsm8k:4:32:0 humaneval:4:32:0 mt-bench:4:32:0 gsm8k:16:64:0 humaneval:16:64:0 mt-bench:16:64:0 gsm8k:1:16:1"}
 MAX_TOKENS=${MAX_TOKENS:-1024}
@@ -88,15 +90,16 @@ run_server() {  # name=method[:draft][:env]
         fi
         sleep 5
     done
-    if [[ ${method} == flashmap* ]] && ! grep -q "FlashMap draft sampler: one pass" "${OUT}/server-${name}.log"; then
-        log "${name}: the FlashMap draft did not load (no 'FlashMap draft sampler' line)"
+    if [[ ${method} == flashmap* ]] && ! grep -q "type=FlashMapDraftModel" "${OUT}/server-${name}.log"; then
+        log "${name}: the FlashMap draft did not load (sglang logged no type=FlashMapDraftModel)"
         kill "${pid}"; wait "${pid}" 2> /dev/null
         return 1
     fi
     log "${name}: healthy; benchmarking"
     python "${REPO}/benchmarks/flashmap/run_cells.py" --name "${name}" --target "${TARGET}" \
         --prompts "${PROMPTS}" --out "${OUT}" --cells "${CELLS}" --port "${PORT}" \
-        --max-tokens "${MAX_TOKENS}" ${OUTPUT_DETAILS:+--output-details} > "${OUT}/bench-${name}.log" 2>&1 \
+        --max-tokens "${MAX_TOKENS}" ${OUTPUT_DETAILS:+--output-details} \
+        ${GREEDY_IDS:+--greedy-ids "${GREEDY_IDS}"} > "${OUT}/bench-${name}.log" 2>&1 \
         || log "${name}: benchmark failed; see ${OUT}/bench-${name}.log"
     kill "${pid}"; wait "${pid}" 2> /dev/null
     log "${name}: done"
@@ -105,7 +108,7 @@ run_server() {  # name=method[:draft][:env]
 for server in ${SERVERS}; do
     if [[ -n ${GPU_LOCK} ]]; then
         export -f run_server server_cmd log
-        export TARGET PROMPTS OUT CELLS MAX_TOKENS MEM_FRACTION MAX_RUNNING PORT REPO OUTPUT_DETAILS
+        export TARGET PROMPTS OUT CELLS MAX_TOKENS MEM_FRACTION MAX_RUNNING PORT REPO OUTPUT_DETAILS GREEDY_IDS
         # GPU_TURNSTILE: taken first, so new shared holders queue behind us.
         ${GPU_TURNSTILE:+flock -x "${GPU_TURNSTILE}"} \
             flock -x "${GPU_LOCK}" bash -c "run_server '${server}'"

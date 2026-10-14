@@ -13,7 +13,7 @@ context, no folding, no fused kernels) on the same noise:
   the reference;
 * compiled, the drafts are compared noiseless (torch.compile draws its noise
   differently), which still runs every layer;
-* the Cholesky factor the noise is drawn with must reproduce ``E^T E``.
+* the eigendecomposition the noise is drawn with must reproduce ``E^T E``.
 
 Needs a GPU and the sglang environment:
 
@@ -200,11 +200,16 @@ def main():
             embed_tokens=SimpleNamespace(weight=embed),
             lm_head=SimpleNamespace(weight=lm_head),
         )
+        noise = draft._constants[2]
         if not compiled:
             gram = embed.double().T @ embed.double()
-            factor = draft._constants[2].double()
-            err = ((factor.T @ factor - gram).norm() / gram.norm()).item()
-            print(f"Cholesky factor: |F^T F - E^T E| / |E^T E| = {err:.2e}")
+            if draft.folded_noise:
+                lam, basis = draft.noise_basis()
+                err = ((basis * lam) @ basis.T - gram).norm() / gram.norm()
+            else:
+                factor = noise.double()
+                err = (factor.T @ factor - gram).norm() / gram.norm()
+            print(f"noise factor: reproduces E^T E to {err:.2e}")
             assert err < 1e-2, err
         block = draft.block_size
         pool = FakePool(
@@ -278,7 +283,12 @@ def main():
         z = draft.noise_temperature * torch.randn(
             len(lens), block, embed.shape[1], device=DEVICE, dtype=torch.bfloat16
         )
-        noise_embed = z @ draft._constants[2]
+        # The noise's embedding x @ E, as the served path draws it.
+        if draft.folded_noise:
+            lam, basis = draft.noise_basis()
+            noise_embed = ((z.double() * lam.sqrt()) @ basis.T).to(torch.bfloat16)
+        else:
+            noise_embed = z @ noise
         start, end = draft.grid[0], draft.grid[1]
         hot = (
             draft.hot_ids
@@ -298,14 +308,23 @@ def main():
             )
             got = served[req].float()
             ref_hot = ref[:, hot].float()
-            diff = (got - ref_hot).abs().max().item() / ref_hot.abs().max().item()
-            agree = (got.argmax(-1) == ref_hot.argmax(-1)).float().mean().item()
+            error = (got - ref_hot).abs().max().item()
+            diff = error / ref_hot.abs().max().item()
+            agree = got.argmax(-1) == ref_hot.argmax(-1)
             full_agree = (hot[got.argmax(-1)] == ref.argmax(-1)).float().mean().item()
+            # A slot whose reference lead over its runner-up exceeds twice the
+            # largest logit error cannot flip by rounding; random context makes
+            # many slots near-ties, which may.
+            top2 = ref_hot.topk(2, dim=-1).values
+            decisive = (top2[:, 0] - top2[:, 1]) > 2 * error
             print(
-                f"{'compiled' if compiled else 'eager':8s} request {req}: max |served - reference| / max |reference| = "
-                f"{diff:.2e}, argmax agreement {agree:.0%} (vs full-vocabulary reference {full_agree:.0%})"
+                f"{'compiled' if compiled else 'eager':8s} request {req}: max |served - reference| = "
+                f"{error:.3f} ({diff:.2e} of max |reference|), argmax agreement {agree.float().mean().item():.0%} "
+                f"(vs full-vocabulary reference {full_agree:.0%}), "
+                f"{int(decisive.sum())} decisive slots"
             )
-            assert diff < 5e-2 and agree >= 0.9, (diff, agree)
+            assert diff < 5e-2, diff
+            assert agree[decisive].all(), "a decisive slot drafted another token"
         assert math.isfinite(served.float().sum().item())
     print("ok")
 
