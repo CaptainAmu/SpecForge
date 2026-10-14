@@ -12,15 +12,25 @@ With no bias, the positions are independent, yet DSPARK's graph-folded sampler
 would still walk them one at a time (an exponential-noise fill and two
 online-softmax kernels per position, or an argmax per position for greedy
 batches). :class:`FlashMapDraftSampler` samples the whole block at once inside
-the draft's CUDA graph: the logits written straight into DSPARK's buffer by one
-GEMM against the folded head, then one argmax (greedy) or one
-``SampleStepTokens`` pass with fresh noise per row and each request's
-temperature, which is exactly DSPARK's per-position sampling since the rows are
-independent; drafted indices of a restricted vocabulary are mapped back to
-token ids in the graph too.
+the draft's CUDA graph: the logits written into DSPARK's buffer by one GEMM
+against the folded head, then one ``SampleStepTokens`` pass with fresh
+exponential noise per row and each request's temperature (exactly DSPARK's
+per-position sampling, since the rows are independent; greedy rows take their
+argmax). Drafted indices of a restricted vocabulary map back to token ids in
+the graph too, and the logits rejection sampling reads stay over the full
+vocabulary (-inf outside the draft vocabulary).
+
+``FLASHMAP_FUSED_SAMPLER=1`` (opt-in; its kernel is unit-tested but not yet
+benchmarked in a server) samples with one kernel instead: each greedy row's
+argmax, each other row Gumbel-max-sampled at its temperature with in-kernel
+Philox noise, so there is no noise buffer, and the full-vocabulary logits are
+scattered only when DSPARK reads them for a sampling batch, so greedy batches
+never pay for them.
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import SampleStepTokens
@@ -29,6 +39,8 @@ from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     DsparkDraftSampler,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
+
+from specforge.serving.sglang.flashmap_kernels import sample_rows
 
 
 class IdentityMarkov(VanillaMarkov):
@@ -79,26 +91,62 @@ class IdentityMarkov(VanillaMarkov):
         return self.hot_ids[tokens], logits
 
 
+class _FullLogits:
+    """DSPARK's ``corrected_out`` for a restricted draft vocabulary: slicing
+    the first ``rows`` scatters those rows' draft-vocabulary logits into the
+    full-vocabulary buffer (-inf elsewhere) and returns them."""
+
+    def __init__(self, full: torch.Tensor, hot: torch.Tensor, hot_ids: torch.Tensor):
+        self.full, self.hot, self.hot_ids = full, hot, hot_ids
+        self.full.fill_(float("-inf"))
+
+    def __getitem__(self, index: slice) -> torch.Tensor:
+        assert index.start is None and index.step is None, index
+        rows = index.stop
+        return self.full[:rows].index_copy_(1, self.hot_ids, self.hot[:rows])
+
+
 class FlashMapDraftSampler(DsparkDraftSampler):
     """DSPARK's graph-folded draft sampler for a FlashMap draft: the whole block
-    in one pass (see the module docstring). Same buffers and contract; its
-    sampling logits stay over the full vocabulary, -inf outside a restricted
-    draft vocabulary."""
+    in one pass (see the module docstring). Same contract."""
+
+    # DsparkDraftSampler state this sampler takes over (sglang 0.5.20).
+    _INHERITED = (
+        "model", "gamma", "sample_from_anchor", "query_token_num", "out",
+        "confidence_out", "folded_sampling", "temperatures", "greedy_mask",
+        "exp_noise", "corrected_out", "_tp_sync",
+    )  # fmt: skip
 
     def __init__(self, sampler: DsparkDraftSampler, *, max_bs: int, device):
+        missing = [name for name in self._INHERITED if not hasattr(sampler, name)]
+        assert not missing, f"DsparkDraftSampler lacks {missing}: unsupported sglang"
         self.__dict__.update(sampler.__dict__)
         assert self.sample_from_anchor and self.confidence_out is None
-        if self.folded_sampling:
-            draft_vocab = self.model.folded_head[0].shape[0]
+        self.fused = os.environ.get("FLASHMAP_FUSED_SAMPLER", "0") == "1"
+        self.hot_logits = None
+        if not self.folded_sampling:
+            return
+        hot_ids = self.model.hot_ids
+        rows, draft_vocab = int(max_bs) * self.gamma, self.model.folded_head[0].shape[0]
+        self.exp_noise = None
+        if not self.fused:
             # Exponential noise for every row of the block, not one position's.
             self.row_noise = torch.empty(
-                (int(max_bs) * self.gamma, draft_vocab),
-                dtype=torch.float32,
-                device=device,
+                (rows, draft_vocab), dtype=torch.float32, device=device
             )
-            self.exp_noise = None
-            if self.model.hot_ids is not None:
+            if hot_ids is not None:
                 self.corrected_out.fill_(float("-inf"))
+            return
+        self.seed = torch.zeros((), dtype=torch.int64, device=device)
+        if hot_ids is not None:
+            # The draft-vocabulary logits outlive the graph replay until DSPARK
+            # reads them (``_FullLogits``).
+            self.hot_logits = torch.empty(
+                (rows, draft_vocab), dtype=self.corrected_out.dtype, device=device
+            )
+            self.corrected_out = _FullLogits(
+                self.corrected_out, self.hot_logits, hot_ids
+            )
 
     def __call__(self, hidden_states, input_ids):
         del input_ids
@@ -106,26 +154,34 @@ class FlashMapDraftSampler(DsparkDraftSampler):
         rows = bs * self.gamma
         weight, bias = self.model.folded_head
         hot_ids = self.model.hot_ids
-        if self.folded_sampling:
-            if hot_ids is None:
-                logits = torch.addmm(
-                    bias, hidden_states, weight.t(), out=self.corrected_out[:rows]
-                )
-            else:
-                logits = torch.addmm(bias, hidden_states, weight.t())
-                self.corrected_out[:rows].index_copy_(1, hot_ids, logits)
-            tokens = SampleStepTokens.execute(
-                step_logits=logits,
-                temperatures=self.temperatures[:bs].repeat_interleave(self.gamma),
-                greedy_mask=self.greedy_mask[:bs].repeat_interleave(self.gamma),
-                exp_noise=self.row_noise[:rows].exponential_(),
-            )
-            tokens = self._tp_sync.sync(SpecTpSyncSite.DSPARK_GRAPH_SAMPLE, tokens)
-        else:
+        if not self.folded_sampling:
             logits = torch.addmm(bias, hidden_states, weight.t())
             tokens = self._tp_sync.sync(
                 SpecTpSyncSite.DSPARK_GRAPH_GREEDY, logits.argmax(dim=-1)
             )
+        else:
+            temperatures = self.temperatures[:bs].repeat_interleave(self.gamma)
+            greedy = self.greedy_mask[:bs].repeat_interleave(self.gamma)
+            if self.fused:
+                out = self.hot_logits if hot_ids is not None else self.corrected_out
+                logits = torch.addmm(bias, hidden_states, weight.t(), out=out[:rows])
+                self.seed.add_(1)
+                tokens = sample_rows(logits, temperatures, greedy, self.seed)
+            else:
+                if hot_ids is None:
+                    logits = torch.addmm(
+                        bias, hidden_states, weight.t(), out=self.corrected_out[:rows]
+                    )
+                else:
+                    logits = torch.addmm(bias, hidden_states, weight.t())
+                    self.corrected_out[:rows].index_copy_(1, hot_ids, logits)
+                tokens = SampleStepTokens.execute(
+                    step_logits=logits,
+                    temperatures=temperatures,
+                    greedy_mask=greedy,
+                    exp_noise=self.row_noise[:rows].exponential_(),
+                )
+            tokens = self._tp_sync.sync(SpecTpSyncSite.DSPARK_GRAPH_SAMPLE, tokens)
         if hot_ids is not None:
             tokens = hot_ids[tokens]
         self.out[:rows].copy_(tokens.reshape(-1))

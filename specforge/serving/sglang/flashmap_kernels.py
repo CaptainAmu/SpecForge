@@ -81,7 +81,7 @@ def _scale(x, scale):
     return (x * scale.to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
 
 
-@torch.library.custom_op("flashmap::block_self_attention", mutates_args=())
+@torch.library.custom_op("specforge_flashmap::block_self_attention", mutates_args=())
 def block_self_attention(
     qkv: torch.Tensor,
     q_norm: torch.Tensor,
@@ -168,7 +168,7 @@ def _rms_norm_rope_kernel(
     tl.store(out + 2 * i + 1, (odd * cos + even * sin).to(tl.bfloat16))
 
 
-@torch.library.custom_op("flashmap::rms_norm_rope", mutates_args=())
+@torch.library.custom_op("specforge_flashmap::rms_norm_rope", mutates_args=())
 def rms_norm_rope(
     x: torch.Tensor, weight: torch.Tensor, freqs: torch.Tensor, eps: float
 ) -> torch.Tensor:
@@ -190,3 +190,61 @@ def _(x, weight, freqs, eps):
 
 
 __all__ = ["block_self_attention", "rms_norm", "rms_norm_rope"]
+
+
+@triton.jit
+def _sample_tiles_kernel(
+    logits_ptr,
+    temperatures_ptr,
+    greedy_ptr,
+    seed_ptr,
+    best_ptr,
+    best_index_ptr,
+    V,
+    n_tiles,
+    BLOCK_V: tl.constexpr,
+):
+    # One program per (row, tile of the vocabulary): the tile's best key and
+    # its first index. A greedy row's key is its logit; a sampled row's is its
+    # logit over the temperature plus Gumbel noise from in-kernel Philox
+    # (Gumbel-max: the argmax is a sample of softmax(logits / T)).
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
+    mask = offs < V
+    key = tl.load(logits_ptr + row * V + offs, mask=mask, other=float("-inf"))
+    key = key.to(tl.float32)
+    if tl.load(greedy_ptr + row) == 0:
+        uniform = tl.rand(tl.load(seed_ptr), row * V + offs)
+        key = key / tl.load(temperatures_ptr + row) - tl.log(-tl.log(uniform))
+    key = tl.where(mask, key, float("-inf"))
+    best = tl.max(key, axis=0)
+    index = tl.min(tl.where(key == best, offs, V), axis=0)
+    tl.store(best_ptr + row * n_tiles + tile, best)
+    tl.store(best_index_ptr + row * n_tiles + tile, index)
+
+
+def sample_rows(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    greedy: torch.Tensor,
+    seed: torch.Tensor,
+    block_v: int = 4096,
+) -> torch.Tensor:
+    """A token per row of contiguous ``logits (rows, V)``: the argmax for
+    ``greedy`` rows, else a sample of ``softmax(logits / temperature)``, with
+    Philox noise seeded by the int64 scalar tensor ``seed`` (advance it between
+    calls, in-graph, for fresh noise). Reads the logits once; no noise buffer."""
+    rows, vocab = logits.shape
+    assert logits.is_contiguous()
+    n_tiles = triton.cdiv(vocab, block_v)
+    best = torch.empty((rows, n_tiles), dtype=torch.float32, device=logits.device)
+    best_index = torch.empty((rows, n_tiles), dtype=torch.int64, device=logits.device)
+    _sample_tiles_kernel[(rows, n_tiles)](
+        logits, temperatures, greedy, seed, best, best_index, vocab, n_tiles,
+        BLOCK_V=block_v,
+    )  # fmt: skip
+    return best_index.gather(1, best.argmax(dim=1, keepdim=True)).squeeze(1)
+
+
+__all__ += ["sample_rows"]

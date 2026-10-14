@@ -31,7 +31,10 @@ DSPARK drives a block draft through a small protocol, implemented here:
   - one jump starts from noise at ``t = 0``, where the state's posterior is
     uniform whatever the noise: its embedding is a constant, and the noise
     enters only through ``x @ E ~ N(0, E^T E)``, drawn as ``z @ L^T`` with
-    ``L L^T = E^T E`` (Cholesky), so no vocabulary-sized noise is ever formed;
+    ``L L^T = E^T E`` (Cholesky), so no vocabulary-sized noise is ever formed.
+    ``FLASHMAP_FOLDED_NOISE=1`` (opt-in, not yet benchmarked) draws it from the
+    eigendecomposition instead, which folds the noise's RMSNorm and ``x_embed``
+    into one GEMM (``_folded_noise``);
   - more jumps (``FLASHMAP_NUM_STEPS``) take their vocabulary-sized inputs from
     a bank of precomputed noise draws (:mod:`.flashmap_jump_bank`) and read
     only the embedding rows of each jump's top predictions.
@@ -48,7 +51,14 @@ Environment knobs: ``FLASHMAP_NUM_STEPS`` (jumps per draft; default the
 export's ``num_steps``), ``FLASHMAP_DRAFT_VOCAB`` (0: the full vocabulary,
 ``<k>``: the export ranking's top k), ``FLASHMAP_JUMP_BANK`` /
 ``FLASHMAP_JUMP_TOPK`` (bank draws, 8192; support per jump, 16),
-``FLASHMAP_COMPILE`` (0 disables torch.compile) and ``FLASHMAP_COMPILE_MODE``.
+``FLASHMAP_COMPILE`` (0 disables torch.compile), ``FLASHMAP_COMPILE_MODE``
+(``max-autotune-no-cudagraphs``; modes that capture their own CUDA graphs
+would nest inside sglang's), and two opt-in variants not yet benchmarked in a
+server: ``FLASHMAP_FOLDED_NOISE=1`` (above) and ``FLASHMAP_FUSED_SAMPLER=1``
+(:mod:`.flashmap_sampler`).
+
+Supported: sglang 0.5.20 (``SUPPORTED_SGLANG``), tensor parallelism 1, a bf16
+draft KV pool, an unpadded target vocabulary without muP logit scaling.
 """
 
 from __future__ import annotations
@@ -60,26 +70,37 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from sgl_kernel.flash_attn import flash_attn_with_kvcache, get_scheduler_metadata
-from sglang.kernels.ops.speculative.dspark.fused_kv_write import (
+
+from specforge.serving.sglang import check_sglang_version
+
+check_sglang_version()
+
+from sgl_kernel.flash_attn import (  # noqa: E402
+    flash_attn_with_kvcache,
+    get_scheduler_metadata,
+)
+from sglang.kernels.ops.speculative.dspark.fused_kv_write import (  # noqa: E402
     fused_kv_norm_rope_write,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_context import (
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput  # noqa: E402
+from sglang.srt.model_executor.forward_context import (  # noqa: E402
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
-from sglang.srt.runtime_context import get_exec
-from sglang.srt.speculative.dspark_components import dspark_worker_v2
-from torch import nn
+from sglang.srt.runtime_context import get_exec, get_model  # noqa: E402
+from sglang.srt.speculative.dspark_components import dspark_worker_v2  # noqa: E402
+from torch import nn  # noqa: E402
 
-from specforge.serving.sglang.flashmap_jump_bank import JumpNoiseBank, top_predictions
-from specforge.serving.sglang.flashmap_kernels import (
+from specforge.serving.sglang.flashmap_jump_bank import (  # noqa: E402
+    JumpNoiseBank,
+    top_predictions,
+)
+from specforge.serving.sglang.flashmap_kernels import (  # noqa: E402
     block_self_attention,
     rms_norm,
     rms_norm_rope,
 )
-from specforge.serving.sglang.flashmap_sampler import (
+from specforge.serving.sglang.flashmap_sampler import (  # noqa: E402
     FlashMapDraftSampler,
     IdentityMarkov,
 )
@@ -88,7 +109,7 @@ logger = logging.getLogger(__name__)
 
 
 # A custom op, so torch.compile traces the draft step through it in one graph.
-@torch.library.custom_op("flashmap::paged_cross_attention", mutates_args=())
+@torch.library.custom_op("specforge_flashmap::paged_cross_attention", mutates_args=())
 def _paged_cross_attention(
     query: torch.Tensor,
     key_buffer: torch.Tensor,
@@ -131,6 +152,16 @@ def _cross_attention_schedule(query_shape, cache_seqlens, page_table):
         page_size=1,
         causal=False,
     )
+
+
+def _server_setting(read, default):
+    """A setting from sglang's runtime context, or ``default`` outside a server
+    (offline checks)."""
+    try:
+        value = read()
+    except Exception:
+        return default
+    return default if value is None else value
 
 
 def rope_freqs(positions: torch.Tensor, head_dim: int, base: float) -> torch.Tensor:
@@ -312,12 +343,25 @@ class FlashMapDraftModel(nn.Module):
         self._vocab_ranking = None  # the export's draft_vocab_ids
         # Scales the starting noise; checks set 0 for deterministic drafts.
         self.noise_temperature = 1.0
+        self.folded_noise = os.environ.get("FLASHMAP_FOLDED_NOISE", "0") == "1"
         self._constants = None
         self._fused_write = None  # (pool id, kernel arguments)
         self._draft = self._draft_impl
         self._anchor_kv = self._anchor_kv_impl
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+        tp_size = _server_setting(get_tensor_model_parallel_world_size, 1)
+        if tp_size != 1:
+            raise NotImplementedError(
+                f"the FlashMap draft runs unsharded: serve with --tp-size 1 (got {tp_size})"
+            )
         if os.environ.get("FLASHMAP_COMPILE", "1") == "1":
             mode = os.environ.get("FLASHMAP_COMPILE_MODE") or None
+            if mode not in (None, "default", "max-autotune-no-cudagraphs"):
+                raise ValueError(
+                    f"FLASHMAP_COMPILE_MODE={mode!r} would capture CUDA graphs "
+                    "inside sglang's; use default or max-autotune-no-cudagraphs"
+                )
             self._draft = torch.compile(self._draft_impl, dynamic=True, mode=mode)
             self._anchor_kv = torch.compile(self._anchor_kv_impl, dynamic=True)
         logger.info(
@@ -392,10 +436,21 @@ class FlashMapDraftModel(nn.Module):
         KV pools. A target with tied embeddings (Qwen3-4B) hands over its
         embedding as the LM head; one without a head of its own falls back to
         the embedding too."""
-        self.embedding = embed_tokens.weight.detach()
-        assert self.embedding.shape == (self.vocab_size, self.target_hidden_size)
+        if self.logits_mup_width_multiplier:
+            raise NotImplementedError("FlashMap does not support muP-scaled targets")
+        embedding = embed_tokens.weight.detach()
         head = getattr(lm_head, "weight", None)
-        self.prepare(self.embedding if head is None else head.detach())
+        head = embedding if head is None else head.detach()
+        for name, weight in (("embedding", embedding), ("LM head", head)):
+            # Rows past the vocabulary would be tensor-parallel padding.
+            if weight.shape != (self.vocab_size, self.target_hidden_size):
+                raise ValueError(
+                    f"the target's {name} is {tuple(weight.shape)}, the draft "
+                    f"expects ({self.vocab_size}, {self.target_hidden_size}); padded "
+                    "or sharded vocabularies are not supported"
+                )
+        self.embedding = embedding
+        self.prepare(head)
 
     @torch.no_grad()
     def prepare(self, lm_head_weight: torch.Tensor) -> None:
@@ -454,8 +509,8 @@ class FlashMapDraftModel(nn.Module):
         """Everything a draft needs that depends only on the jump times: per
         jump the AdaLN modulations ``(1 + scale, shift, gate)`` of every norm;
         the embedded starting state's constant (the uniform posterior's
-        embedding) and the Cholesky factor of ``E^T E`` its noise is drawn
-        with."""
+        embedding); and, for one jump, what its noise is drawn with: the
+        Cholesky factor of ``E^T E``, or the folded path (``_folded_noise``)."""
         device = self.fc.weight.device
         per_jump = []
         for start, end in zip(self.grid[:-1], self.grid[1:]):
@@ -479,18 +534,46 @@ class FlashMapDraftModel(nn.Module):
             (1, self.vocab_size), 1.0 / self.vocab_size, device=device
         ).to(embedding.dtype)
         uniform = self.state_norm(posterior @ embedding)[0]
-        # E^T E accumulated in float64 a chunk of rows at a time.
+        noise = None
+        if self.num_steps == 1 and self.folded_noise:
+            noise = self._folded_noise(uniform)
+        elif self.num_steps == 1:
+            gram = self._embedding_gram()
+            noise = torch.linalg.cholesky(gram).T.to(embedding.dtype)
+        return per_jump, uniform, noise
+
+    def _embedding_gram(self) -> torch.Tensor:
+        """``E^T E`` in float64 (``E`` the target's embedding), accumulated a
+        chunk of rows at a time."""
+        hidden = self.target_hidden_size
         gram = torch.zeros(
-            self.target_hidden_size,
-            self.target_hidden_size,
-            dtype=torch.float64,
-            device=device,
+            hidden, hidden, dtype=torch.float64, device=self.embedding.device
         )
         for start in range(0, self.vocab_size, 8192):
-            part = embedding[start : start + 8192].double()
+            part = self.embedding[start : start + 8192].double()
             gram += part.T @ part
-        noise_factor = torch.linalg.cholesky(gram).T.to(embedding.dtype)
-        return per_jump, uniform, noise_factor
+        return gram
+
+    def noise_basis(self):
+        """``(lam, Q)`` in float64 with ``E^T E = Q diag(lam) Q^T``."""
+        lam, basis = torch.linalg.eigh(self._embedding_gram())
+        return lam.clamp_min(0), basis
+
+    def _folded_noise(self, uniform: torch.Tensor):
+        """The first layer's input for one jump from pure noise ``x``: with
+        ``x @ E = (z * sqrt(lam)) @ Q^T = y``, ``z ~ N(0, I_H)``,
+
+            x_embed(uniform + gate * noise_norm(y))
+              = x_embed(uniform) + gate * r * (z @ M),
+            r = rsqrt(sum(lam z^2) / H + eps),  M = diag(sqrt(lam)) Q^T diag(w) W_x^T,
+
+        ``w`` the noise norm's weight. Returns ``(lam / H, M, x_embed(uniform))``."""
+        lam, basis = self.noise_basis()
+        weight = self.noise_norm.weight.double()
+        fold = (lam.sqrt()[:, None] * basis.T) * weight[None, :]
+        proj = (fold @ self.x_embed.weight.double().T).to(self.embedding.dtype)
+        variance = (lam / self.target_hidden_size).float()
+        return variance, proj, self.x_embed(uniform)
 
     def noise_gate_at(self, start: float, end: float) -> torch.Tensor:
         """The weight of the state's noise term for a jump from ``start`` to
@@ -527,10 +610,36 @@ class FlashMapDraftModel(nn.Module):
         assert not target_hidden_is_projected
         if target_hidden.shape[0] == 0:
             return
-        meta, k_norm_weights, cos_sin, kv_size = self._fused_write_args(pool)
-        # k-norm, RoPE and the write for every layer in one launch, skipping
-        # the uncommitted verify columns.
-        commit = cache_loc_2d is not None and commit_lens is not None
+        args = self._fused_write_args(pool)
+        if cache_loc_2d is not None and commit_lens is not None:
+            # Verify windows: only each request's committed columns are written.
+            self._write_context(
+                target_hidden,
+                positions,
+                cache_loc_2d.reshape(-1),
+                args,
+                commit_lens=commit_lens,
+                locs_row_width=cache_loc_2d.shape[1],
+            )
+            return
+        # A prefill, a chunk of rows at a time: every layer's keys and values of
+        # one row take 6 * 2 * 2048 bf16 (48 KB for Qwen3-8B's map).
+        chunk = self._WRITE_CHUNK
+        for start in range(0, target_hidden.shape[0], chunk):
+            self._write_context(
+                target_hidden[start : start + chunk],
+                positions[start : start + chunk],
+                cache_loc[start : start + chunk],
+                args,
+            )
+
+    # Prefill rows projected at once by write_target_hidden_kv.
+    _WRITE_CHUNK = 2048
+
+    def _write_context(self, target_hidden, positions, locs, args, **commit):
+        """k-norm, RoPE and the write for every layer in one launch (sglang's
+        fused DSpark kernel, which skips uncommitted verify columns)."""
+        meta, k_norm_weights, cos_sin, kv_size = args
         context = rms_norm(
             self.fc(target_hidden.to(self._ctx_kv_weight.dtype)),
             self._hidden_norm_weight,
@@ -542,14 +651,13 @@ class FlashMapDraftModel(nn.Module):
             k_norm_weights,
             cos_sin,
             positions,
-            cache_loc_2d.reshape(-1) if commit else cache_loc,
+            locs,
             self.num_stages,
             kv_size,
             self.head_dim,
             self.qk_norm_eps,
-            commit_lens=commit_lens if commit else None,
-            locs_row_width=cache_loc_2d.shape[1] if commit else None,
             is_neox_style=False,  # FlashMap rotates interleaved pairs
+            **commit,
         )
 
     def _fused_write_args(self, pool):
@@ -561,7 +669,11 @@ class FlashMapDraftModel(nn.Module):
             for layer_id in range(self.num_stages)
         ]
         for buf in (buf for pair in buffers for buf in pair):
-            assert buf.is_cuda and buf.dtype == torch.bfloat16, buf.dtype
+            if not buf.is_cuda or buf.dtype != torch.bfloat16:
+                raise ValueError(
+                    f"the FlashMap draft KV pool must be bf16 on CUDA, got {buf.dtype} "
+                    "(a quantized --kv-cache-dtype is not supported for the draft)"
+                )
             assert buf.shape[1:] == (self.num_heads, self.head_dim), buf.shape
             assert buf.stride(1) == self.head_dim and buf.stride(2) == 1
         device = self._ctx_kv_weight.device
@@ -576,8 +688,14 @@ class FlashMapDraftModel(nn.Module):
         k_norm_weights = torch.stack(
             [layer.cross_attn.k_norm.weight.float() for layer in self.layers]
         )
-        # Row p: cos then sin of p times each frequency.
-        max_positions = int(self.config.max_position_embeddings) + self.block_size + 1
+        # Row p: cos then sin of p times each frequency, for every position the
+        # server can reach (the fused kernel does not bound-check).
+        context_length = _server_setting(lambda: get_model().context_length, 0)
+        max_positions = (
+            max(int(self.config.max_position_embeddings), int(context_length))
+            + self.block_size
+            + 1
+        )
         freqs = rope_freqs(
             torch.arange(max_positions, device=device), self.head_dim, self.rope_theta
         )
@@ -600,13 +718,17 @@ class FlashMapDraftModel(nn.Module):
         which ``compute_base_logits`` (or the folded sampler) maps to logits.
 
         DSPARK asks for ``gamma`` drafts per request, the block size unless
-        ``--speculative-num-draft-tokens`` verifies fewer (at high concurrency
+        ``--speculative-dspark-block-size`` verifies fewer (at high concurrency
         the target's verify is compute-bound and the last drafts are rarely
         accepted); the map always drafts its whole block, as it was trained,
         and hands over the first ``gamma``."""
         del input_embeds, get_embedding, pp_proxy_tensors
         bsz, block_size = forward_batch.batch_size, self.block_size
         gamma = positions.numel() // bsz
+        assert gamma <= block_size, (
+            f"--speculative-dspark-block-size {gamma} exceeds the map's block of "
+            f"{block_size} drafts"
+        )
         pool = get_token_to_kv_pool()
         anchor_positions = positions.view(bsz, gamma)[:, 0]
         block_positions = anchor_positions[:, None] + torch.arange(
@@ -663,24 +785,41 @@ class FlashMapDraftModel(nn.Module):
     ) -> torch.Tensor:
         """The block's ``num_steps`` jumps, a pure tensor function so it can be
         compiled; returns the last jump's hidden states ``(bs * K, dim)``."""
-        _, uniform, noise_factor = self._constants
+        _, uniform, noise = self._constants
         bsz, block_size = block_positions.shape
         slots = bsz * block_size
         # The slots sit at anchor + 1 .. anchor + K.
         freqs = rope_freqs(block_positions + 1, self.head_dim, self.rope_theta)
         attend = (freqs, page_table, cache_seqlens, schedule, keys, values)
-        if self.num_steps == 1:
+        if self.num_steps == 1 and not self.folded_noise:
             # One jump from t = 0: the noise drawn in the embedding's space.
-            noise = self.noise_temperature * torch.randn(
+            z = self.noise_temperature * torch.randn(
                 bsz,
                 block_size,
-                noise_factor.shape[0],
+                noise.shape[0],
                 device=block_positions.device,
-                dtype=noise_factor.dtype,
+                dtype=noise.dtype,
             )
             gate = self.noise_gate_at(self.grid[0], self.grid[1])
-            embedded = uniform + gate * self.noise_norm(noise @ noise_factor)
-            return self._denoise(0, embedded, *attend).reshape(slots, -1)
+            embedded = uniform + gate * self.noise_norm(z @ noise)
+            hidden = self.x_embed(embedded)
+            return self._denoise(0, hidden, *attend).reshape(slots, -1)
+        if self.num_steps == 1:
+            # The same, embedded by the folded path (_folded_noise).
+            variance, proj, embedded_uniform = noise
+            z = self.noise_temperature * torch.randn(
+                bsz,
+                block_size,
+                proj.shape[0],
+                device=block_positions.device,
+                dtype=proj.dtype,
+            )
+            mean_square = (z.float().square() * variance).sum(-1, keepdim=True)
+            scale = self.noise_gate_at(self.grid[0], self.grid[1]) * torch.rsqrt(
+                mean_square + self.rms_norm_eps
+            )
+            hidden = embedded_uniform + (scale * (z @ proj).float()).to(proj.dtype)
+            return self._denoise(0, hidden, *attend).reshape(slots, -1)
         # Banked jumps (flashmap_jump_bank.py): no vocabulary-sized state, the
         # predictions between jumps from the draft vocabulary's head.
         bank = self.jump_bank
@@ -691,24 +830,23 @@ class FlashMapDraftModel(nn.Module):
         for step in range(self.num_steps):
             if step:
                 embedded = bank.jump_input(self, step, rows, seeds, supports)
-            hidden = self._denoise(
-                step, embedded.view(bsz, block_size, -1), *attend
-            ).reshape(slots, -1)
+            hidden = self.x_embed(embedded.view(bsz, block_size, -1))
+            hidden = self._denoise(step, hidden, *attend).reshape(slots, -1)
             if step + 1 < self.num_steps:
                 logits = F.linear(hidden, weight, bias)
                 supports.append(top_predictions(logits, self.jump_topk, self.hot_ids))
         return hidden
 
     def _denoise(
-        self, step, embedded, freqs, page_table, cache_seqlens, schedule, keys, values
+        self, step, hidden, freqs, page_table, cache_seqlens, schedule, keys, values
     ) -> torch.Tensor:
         """One evaluation of the map at jump ``step``'s times on the embedded
-        state ``(bs, K, hidden)``; returns the final AdaLN's output."""
+        state after ``x_embed``, ``(bs, K, dim)``; returns the final AdaLN's
+        output."""
         modulations, (final_scale, final_shift) = self._constants[0][step]
-        bsz, block_size, _ = embedded.shape
+        bsz, block_size, _ = hidden.shape
         shape = (bsz, block_size, self.num_heads, self.head_dim)
         eps = self.layer_norm_eps
-        hidden = self.x_embed(embedded)
         for i, layer in enumerate(self.layers):
             (s_scale, s_shift, s_gate), (c_scale, c_shift, c_gate), mlp = modulations[i]
             m_scale, m_shift, m_gate = mlp
@@ -749,42 +887,54 @@ EntryClass = [FlashMapDraftModel]
 
 # --- DSPARK worker hooks, for FlashMap drafts only -----------------------------
 
-_dspark_init_cuda_graphs = dspark_worker_v2.DSparkWorkerV2.init_cuda_graphs
-_dspark_build_draft_sampler = dspark_worker_v2.DSparkWorkerV2._maybe_build_draft_sampler
+_Worker = dspark_worker_v2.DSparkWorkerV2
 
 
 def _no_attention_metadata(*args, **kwargs) -> None:
     return None
 
 
-def _init_cuda_graphs(self):
-    if getattr(self.draft_model, "flashmap", False):
-        # FlashMap attends through its own paged cross-attention and never
-        # reads the draft attention backend: skip the metadata it prepares
-        # every step.
-        backend = self.draft_model_runner.attn_backend
-        assert backend is not self.model_runner.attn_backend
-        for name in (
-            "init_forward_metadata",
-            "init_forward_metadata_capture_cuda_graph",
-            "init_forward_metadata_replay_cuda_graph",
-        ):
-            setattr(backend, name, _no_attention_metadata)
-    return _dspark_init_cuda_graphs(self)
+def _wrap_init_cuda_graphs(init_cuda_graphs):
+    def wrapped(self, *args, **kwargs):
+        if getattr(self.draft_model, "flashmap", False):
+            # FlashMap attends through its own paged cross-attention and never
+            # reads the draft attention backend: skip the metadata it prepares
+            # every step.
+            backend = self.draft_model_runner.attn_backend
+            assert backend is not self.model_runner.attn_backend
+            for name in (
+                "init_forward_metadata",
+                "init_forward_metadata_capture_cuda_graph",
+                "init_forward_metadata_replay_cuda_graph",
+            ):
+                setattr(backend, name, _no_attention_metadata)
+        return init_cuda_graphs(self, *args, **kwargs)
+
+    return wrapped
 
 
-def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
-    sampler = _dspark_build_draft_sampler(self, available_memory_gb=available_memory_gb)
-    if sampler is None or not getattr(self.draft_model, "flashmap", False):
+def _wrap_build_draft_sampler(build_draft_sampler):
+    def wrapped(self, *args, **kwargs):
+        sampler = build_draft_sampler(self, *args, **kwargs)
+        if sampler is None or not getattr(self.draft_model, "flashmap", False):
+            return sampler
+        max_bs = max(get_exec().graph.cuda_graph_config.decode.bs)
+        sampler = FlashMapDraftSampler(sampler, max_bs=max_bs, device=self.device)
+        logger.info(
+            "FlashMap draft sampler: one pass over the block (folded sampling %s, "
+            "fused kernel %s)",
+            sampler.folded_sampling,
+            sampler.fused,
+        )
         return sampler
-    max_bs = max(get_exec().graph.cuda_graph_config.decode.bs)
-    sampler = FlashMapDraftSampler(sampler, max_bs=max_bs, device=self.device)
-    logger.info(
-        "FlashMap draft sampler: one pass over the block (folded sampling %s)",
-        sampler.folded_sampling,
+
+    return wrapped
+
+
+# Installed once, however often the module is imported.
+if not getattr(_Worker, "_specforge_flashmap_hooks", False):
+    _Worker.init_cuda_graphs = _wrap_init_cuda_graphs(_Worker.init_cuda_graphs)
+    _Worker._maybe_build_draft_sampler = _wrap_build_draft_sampler(
+        _Worker._maybe_build_draft_sampler
     )
-    return sampler
-
-
-dspark_worker_v2.DSparkWorkerV2.init_cuda_graphs = _init_cuda_graphs
-dspark_worker_v2.DSparkWorkerV2._maybe_build_draft_sampler = _maybe_build_draft_sampler
+    _Worker._specforge_flashmap_hooks = True
