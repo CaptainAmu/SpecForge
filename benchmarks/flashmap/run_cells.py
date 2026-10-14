@@ -7,10 +7,12 @@ minutes on a network filesystem). Used by bench_sglang.sh.
 """
 
 import argparse
+import json
 import os
 import sys
 import traceback
 
+import requests
 from sglang.benchmark.serving import cli_main
 
 
@@ -26,6 +28,13 @@ def main():
     parser.add_argument("--port", type=int, default=31000)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--output-details", action="store_true")
+    parser.add_argument(
+        "--greedy-ids",
+        type=int,
+        default=0,
+        help="also save the token ids of greedy outputs for the first N prompts of "
+        "each task, one request at a time, for check_greedy.py",
+    )
     args = parser.parse_args()
 
     def run(name, task, concurrency, count, temperature):
@@ -69,6 +78,32 @@ def main():
     for cell in args.cells.split():
         task, concurrency, count, temperature = cell.split(":")
         run(args.name, task, int(concurrency), int(count), float(temperature))
+    if args.greedy_ids:
+        save_greedy_ids(args)
+
+
+def save_greedy_ids(args):
+    tasks = dict.fromkeys(cell.split(":")[0] for cell in args.cells.split())
+    with open(os.path.join(args.out, f"greedy-{args.name}.jsonl"), "w") as out:
+        for task in tasks:
+            with open(os.path.join(args.prompts, f"{task}.jsonl")) as src:
+                rows = [json.loads(line) for line in src][: args.greedy_ids]
+            for row in rows:
+                prompt = row["conversations"][0]["content"]
+                response = requests.post(
+                    f"http://127.0.0.1:{args.port}/generate",
+                    json={
+                        "text": prompt,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": args.max_tokens,
+                        },
+                    },
+                    timeout=600,
+                ).json()
+                record = {"task": task, "prompt": prompt}
+                record["output_ids"] = response["output_ids"]
+                out.write(json.dumps(record) + "\n")
 
 
 if __name__ == "__main__":
