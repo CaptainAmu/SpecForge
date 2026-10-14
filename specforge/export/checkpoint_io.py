@@ -158,6 +158,15 @@ def materialize_draft(
     from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 
     draft_config = AutoDraftModelConfig.from_file(draft_config_path)
+    # Drafts whose architecture depends on the checkpoint (a FlashMap flow or
+    # map) resolve it from the weights.
+    adapt = getattr(
+        AutoDraftModel._model_cls_from_config(draft_config),
+        "adapt_config_to_checkpoint",
+        None,
+    )
+    if adapt is not None:
+        adapt(draft_config, state["draft_state_dict"])
     model = AutoDraftModel.from_config(draft_config, torch_dtype=torch.bfloat16)
     missing, unexpected = model.load_state_dict(state["draft_state_dict"], strict=False)
     if unexpected:
@@ -166,8 +175,13 @@ def materialize_draft(
             f"does not have: {sorted(unexpected)}"
         )
     tolerated = {"t2d", "d2t"} if vocab_mapping_path else set()
+    # Only the target-copied token embedding and LM head may be absent; other
+    # "*embed*" weights (e.g. FlashMap's x_embed/time_embed/jump_embed) train.
+    target_copies = {"embed_tokens", "lm_head"}
     non_embed_missing = [
-        key for key in missing if "embed" not in key.lower() and key not in tolerated
+        key
+        for key in missing
+        if target_copies.isdisjoint(key.split(".")[:-1]) and key not in tolerated
     ]
     if non_embed_missing:
         raise ValueError(
