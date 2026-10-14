@@ -23,6 +23,9 @@ training:
   accumulation_steps: 32
   learning_rate: 6.0e-4
   warmup_ratio: 0.04
+  adam_beta2: 0.95
+  weight_decay: 0.1
+  fsdp_sharding: NO_SHARD
   max_grad_norm: 1.0
   attention_backend: flex_attention
   num_anchors: 512

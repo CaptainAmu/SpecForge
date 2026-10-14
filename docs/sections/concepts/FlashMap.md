@@ -48,10 +48,11 @@ under the decoding-error schedule (Flow Map Language Models, eq. 25). The
 `flashmap/ce_loss@tau{0..3}` metrics split the loss by quartile of `tau`.
 
 **Map (`flashmap_stage: map`).** The flow at `model.flashmap_flow_checkpoint`
-is frozen and the map starts as a copy of it. Its end-time embedding starts at
-zero, and its noise read-out is gated off on the diagonal `s = t`, so the
-initial map is exactly the flow. Training uses the semigroup objective (eq. 23,
-Algorithm 7) with the official implementation's batch split:
+is frozen and the map starts as a copy of it. Its end-time embedding's output
+layer starts at zero and its noise read-out is gated off on the diagonal
+`s = t`, so on the diagonal the initial map is exactly the flow's denoiser
+(jumps `s < t` already read their noise). Training uses the semigroup objective
+(eq. 23, Algorithm 7) with the official implementation's batch split:
 
 - `flashmap_diagonal_fraction` (0.5) of the blocks train `delta_{t,t}` against
   the frozen flow's denoiser;
@@ -60,14 +61,21 @@ Algorithm 7) with the official implementation's batch split:
 - off-diagonal blocks are trained toward the map's own two half-jumps,
   `gamma delta_{s,u} + (1 - gamma) delta_{u,t}`, under stop-gradient;
 - times are drawn in the schedule's `tau` and stratified over the batch
-  (`flashmap_antithetic_sampling`).
+  (`flashmap_antithetic_sampling`);
+- categories and times are drawn for every anchor slot of the padded batch
+  (`batch_size * num_anchors`), so sequences with few valid anchors still get
+  drafting-jump blocks.
 
 The loss is soft-target cross entropy, which has the same gradients as the
 KL the paper uses. `map_kl` reports the KL, overall and for the
 `diag`/`off`/`boundary` groups. `flashmap/acc@boundary` is the argmax
 accuracy of the jump that drafting uses. Each map step evaluates the network
 three times on vocabulary-sized states, so the map draws fewer anchors per
-sequence than the flow (`num_anchors` 128 versus 512).
+sequence than the flow (`num_anchors` 128 versus 512; the map stage warns when
+it is left at the shared default 512). For FlashMap, `loss_decay_gamma: null`
+means the recipe's 7; set 0 to disable the slot decay. Each data-parallel rank
+draws its own anchors, times and noise (the training device's generator is
+seeded with `seed + rank` and checkpointed per rank).
 
 ## Train
 
@@ -105,13 +113,19 @@ target layers, chosen as DFlash chooses them. FlashMap trains over the full
 target vocabulary: the serving export can restrict the drafting vocabulary,
 so `model.vocab_mapping_path` is rejected.
 
-The paper's recipe trained the flow on 500k PerfectBlend conversations with
-regenerated target answers: 20 epochs at learning rate 6e-4, global batch 256
-sequences, and slot decay `gamma = 7`. The map then trained 12 epochs at 5e-5.
-It used AdamW with `betas = (0.9, 0.95)`, weight decay 0.1 on the flow's weight
-matrices (which removed loss spikes at that scale), and a warmup-stable-decay
-schedule for the map. SpecForge's optimizer does not expose betas, weight decay
-or that schedule yet; the recipes keep its AdamW defaults and cosine schedule.
+The recipes follow the released models' training, which used 500k PerfectBlend
+conversations with regenerated target answers and a global batch of 256
+sequences. The flow trained 20 epochs at learning rate 6e-4, with a cosine
+schedule, AdamW `adam_beta2: 0.95` and `weight_decay: 0.1`; the decay applies to
+weight matrices only, and it removed loss spikes at that scale. The map trained
+12 epochs at 5e-5, with `lr_scheduler: wsd` (warmup 0.04, then the peak rate, then
+an anneal over the last `lr_decay_ratio: 0.2`), `adam_beta2: 0.95` and no weight
+decay. Both used slot decay `gamma = 7` and gradient clipping at 1.
+
+The recipes train data parallel with `fsdp_sharding: NO_SHARD` (DDP), which suits
+a draft of about 0.5B parameters. The sharded modes also work: the DiT is one
+FSDP unit, because its cross-attention context is projected once per step and
+read by every evaluation.
 
 ## Export and serve
 
@@ -131,3 +145,13 @@ python -m specforge.export.flashmap \
 
 Then serve the second directory as described in
 [Serving FlashMap with SGLang](../basic_usage/flashmap_sglang.md).
+
+The same command exports a stage-1 flow: the exporter reads from the weights
+whether a checkpoint holds a flow or a map, so the map's draft config serves
+for both, and the exported `config.json` records `flow_map`. An exported
+directory loads back into SpecForge (`model.draft_checkpoint_path` or
+`model.flashmap_flow_checkpoint`) as it is. To load it with plain transformers
+(`trust_remote_code=True`), copy `configuration_flashmap.py` and
+`modeling_flashmap.py` from a released FlashMap model folder into it and add
+`"auto_map": {"AutoConfig": "configuration_flashmap.FlashMapConfig",
+"AutoModel": "modeling_flashmap.FlashMapDraftModel"}` to its `config.json`.

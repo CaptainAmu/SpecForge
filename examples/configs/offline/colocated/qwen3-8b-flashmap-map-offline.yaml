@@ -27,6 +27,10 @@ training:
   accumulation_steps: 32
   learning_rate: 5.0e-5
   warmup_ratio: 0.04
+  lr_scheduler: wsd
+  lr_decay_ratio: 0.2
+  adam_beta2: 0.95
+  fsdp_sharding: NO_SHARD
   max_grad_norm: 1.0
   attention_backend: flex_attention
   # Each step evaluates the map three times on vocabulary-sized states, so it

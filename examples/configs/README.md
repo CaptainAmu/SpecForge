@@ -282,7 +282,11 @@ Common fields:
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
 | `training.fsdp_sharding` | `SHARD_GRAD_OP` | Trainer FSDP mode: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
-| `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine` or `constant`. |
+| `training.lr_scheduler` | `cosine` | Learning-rate schedule after warmup: `cosine`, `constant`, or `wsd` (hold the peak rate, then a cosine anneal over the last `lr_decay_ratio` of the steps). |
+| `training.lr_decay_ratio` | `0.2` | `wsd` only: fraction of the optimizer steps spent annealing. |
+| `training.adam_beta1` | `0.9` | AdamW first-moment decay. |
+| `training.adam_beta2` | `0.999` | AdamW second-moment decay. |
+| `training.weight_decay` | `0.0` | AdamW decoupled weight decay on weight matrices; biases, norm gains, and embedding tables are not decayed. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
 | `training.max_grad_norm` | `0.5` | Positive gradient-clipping norm. |
 | `training.optimizer_cpu_offload` | `false` | Keep the optimizer's FP32 master parameters and Adam state on CPU. |
@@ -311,7 +315,7 @@ Strategy-specific fields should be written only when tuning that objective:
 | EAGLE3 | `training.ttt_length` (`7`), `training.lk_loss_type` (`null`; `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`) |
 | DFlash / DFlash 2 / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), `training.loss_type` (`dflash`; fixed decay, or `dpace`; dynamic weighting), DFlash/DFlash 2's `training.lk_loss_type` (`null`; CE, `lambda`, `alpha`, or `tv`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`), DFlash 2's CE selector objective controls `training.dflash2_selector_loss_alpha` (`1.0`), `training.dflash2_selector_warmup_ratio` (`0.0`), `training.dflash2_selector_ramp_ratio` (`0.0`), and `training.dflash2_selector_stop_gradient` (`false`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
 | DSpark | Token-pooled objective with valid-first-target anchors and distributed ratio telemetry. Configure the shared `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`; production recipes use `4.0`), and `training.objective_chunk_blocks` (`128`; `0` materializes all objective logits), plus `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), and `training.dspark_confidence_head_alpha` (`1.0`). |
-| FlashMap | `training.flashmap_stage` (`flow`; then `map`, which needs `model.flashmap_flow_checkpoint`), the shared `training.num_anchors` (recipes use `512` for the flow and `128` for the map), `training.loss_decay_gamma` (recipes use `7.0`), and `training.objective_chunk_blocks` (`128`), plus the map stage's semigroup split `training.flashmap_diagonal_fraction` (`0.5`), `training.flashmap_boundary_prob` (`0.0625`), and `training.flashmap_antithetic_sampling` (`true`). See the [FlashMap guide](../../docs/sections/concepts/FlashMap.md). |
+| FlashMap | `training.flashmap_stage` (`flow`; then `map`, which needs `model.flashmap_flow_checkpoint`), the shared `training.num_anchors` (recipes use `512` for the flow and `128` for the map; the map stage warns at the shared default `512`), `training.loss_decay_gamma` (`null` means FlashMap's `7.0`; `0` disables the decay), and `training.objective_chunk_blocks` (`128`), plus the map stage's semigroup split `training.flashmap_diagonal_fraction` (`0.5`), `training.flashmap_boundary_prob` (`0.0625`), and `training.flashmap_antithetic_sampling` (`true`). See the [FlashMap guide](../../docs/sections/concepts/FlashMap.md). |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
 | MTP | `training.mtp_objective_chunk_size` (`4096` token positions per `lm_head` + cross-entropy chunk; `0` disables chunking). |
 

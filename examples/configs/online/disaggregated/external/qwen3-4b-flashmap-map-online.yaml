@@ -20,6 +20,10 @@ training:
   batch_size: 1
   accumulation_steps: 32
   warmup_ratio: 0.04
+  lr_scheduler: "wsd"
+  lr_decay_ratio: 0.2
+  adam_beta2: 0.95
+  fsdp_sharding: "NO_SHARD"
   max_grad_norm: 1
   attention_backend: "flex_attention"
   loss_decay_gamma: 7
