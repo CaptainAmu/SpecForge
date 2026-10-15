@@ -11,7 +11,9 @@
 The output loads back through ``AutoDraftModel.from_pretrained`` (e.g. to
 finetune from it). EAGLE-family embeddings may be absent by design — training
 reloads frozen embeddings from the target — while DFlash-family drafts do not
-own an embedding at all.
+own an embedding at all. A FlashMap draft is written in the FlashMap release
+format instead (:mod:`specforge.export.flashmap`), which the ``flashmap``
+package serves in SGLang and vLLM and which also loads back into SpecForge.
 """
 
 from __future__ import annotations
@@ -73,6 +75,9 @@ def export_to_hf(
     vocab_mapping_path: Optional[str] = None,
     embedding_source: Optional[str] = None,
     embedding_key: str = "model.embed_tokens.weight",
+    target_model: Optional[str] = None,
+    draft_vocab: Optional[str] = None,
+    draft_vocab_size: Optional[int] = None,
 ) -> str:
     """Write the checkpoint's draft as an HF directory; returns ``output_dir``.
 
@@ -82,11 +87,36 @@ def export_to_hf(
     (the target model path/dir — the embedding is deterministic from it) unless
     the checkpoint itself carries ``embed_tokens.weight``. A randomly
     initialized embedding would silently break serving, so its absence raises.
+
+    ``target_model``, ``draft_vocab`` and ``draft_vocab_size`` apply to FlashMap
+    drafts only (see :func:`specforge.export.flashmap.export_flashmap_release`).
     """
+    from specforge.export.flashmap import export_flashmap_release, is_flashmap_config
+
+    flashmap = is_flashmap_config(draft_config_path)
+    if flashmap and (vocab_mapping_path or embedding_source):
+        raise ValueError(
+            "a FlashMap draft borrows the target's embedding and drafts over the "
+            "full vocabulary in training: --vocab-mapping and --embedding-source do "
+            "not apply (--draft-vocab ships a draft-vocabulary ranking)"
+        )
+    if not flashmap and (target_model or draft_vocab or draft_vocab_size):
+        raise ValueError(
+            "--target-model, --draft-vocab and --draft-vocab-size apply to FlashMap "
+            "drafts only"
+        )
     state = resolve_training_state(checkpoint_path)
     model = materialize_draft(
         state, draft_config_path, vocab_mapping_path=vocab_mapping_path
     )
+    if flashmap:
+        return export_flashmap_release(
+            model,
+            output_dir,
+            target_model=target_model,
+            draft_vocab=draft_vocab,
+            draft_vocab_size=draft_vocab_size,
+        )
     full_state = dict(model.state_dict())
     owns_embedding = hasattr(model, "embed_tokens")
     if owns_embedding and "embed_tokens.weight" not in state["draft_state_dict"]:
@@ -139,6 +169,11 @@ def main(argv=None) -> int:
         "(required unless the checkpoint carries embed_tokens.weight)",
     )
     parser.add_argument("--embedding-key", default="model.embed_tokens.weight")
+    parser.add_argument("--target-model", default=None, help="FlashMap: the target")
+    parser.add_argument(
+        "--draft-vocab", default=None, help="FlashMap: a token ranking to ship"
+    )
+    parser.add_argument("--draft-vocab-size", type=int, default=None)
     args = parser.parse_args(argv)
     out = export_to_hf(
         args.checkpoint,
@@ -147,6 +182,9 @@ def main(argv=None) -> int:
         vocab_mapping_path=args.vocab_mapping,
         embedding_source=args.embedding_source,
         embedding_key=args.embedding_key,
+        target_model=args.target_model,
+        draft_vocab=args.draft_vocab,
+        draft_vocab_size=args.draft_vocab_size,
     )
     print(f"exported HF draft to {out}")
     return 0

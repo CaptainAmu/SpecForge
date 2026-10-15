@@ -1,6 +1,7 @@
 # coding=utf-8
 """FlashMap through the public CLI on CPU: flow stage, map stage distilled from
-the flow's run directory, and HF export of both.
+the flow's run directory, and HF export of both (the map in the FlashMap
+release format).
 
 Each leg is a ``specforge`` process, so the test takes minutes; it runs when
 ``SPECFORGE_RUN_CLI_TESTS=1``."""
@@ -143,12 +144,17 @@ class FlashMapCliPipelineTest(unittest.TestCase):
                 f"{root}/draft.json",
                 "--output-dir",
                 export,
+                "--target-model",
+                f"{root}/target",
             )
             self.assertEqual(0, result.returncode, result.stderr[-4000:])
             with open(os.path.join(export, "config.json")) as handle:
                 config = json.load(handle)
             self.assertEqual("flashmap", config["model_type"])
-            self.assertTrue(config["flow_map"])
+            self.assertNotIn("flow_map", config)  # a release config: a map
+            verifier = config["speculators_config"]["verifier"]
+            self.assertEqual(["Qwen3ForCausalLM"], verifier["architectures"])
+            self.assertLess(config["dspark_config"]["mask_token_id"], VOCAB)
             weights = load_file(os.path.join(export, "model.safetensors"))
             self.assertIn("jump_embed.linear_2.weight", weights)
             self.assertIn("layers.1.cross_attn.k_proj.weight", weights)
@@ -167,6 +173,8 @@ class FlashMapCliPipelineTest(unittest.TestCase):
                 f"{root}/draft.json",
                 "--output-dir",
                 flow_export,
+                "--target-model",
+                f"{root}/target",
             )
             self.assertEqual(0, result.returncode, result.stderr[-4000:])
             with open(os.path.join(flow_export, "config.json")) as handle:

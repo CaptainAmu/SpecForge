@@ -281,6 +281,26 @@ def train(
     default="model.embed_tokens.weight",
     show_default=True,
 )
+@click.option(
+    "--target-model",
+    default=None,
+    metavar="PATH",
+    help="FlashMap, HF export: the target the draft serves with (default: the "
+    "draft config's target_model).",
+)
+@click.option(
+    "--draft-vocab",
+    default=None,
+    metavar="PATH",
+    help="FlashMap, HF export: a token ranking (ids/counts safetensors) shipped as "
+    "draft_vocab.safetensors, whose most frequent tokens the draft serves over.",
+)
+@click.option(
+    "--draft-vocab-size",
+    type=int,
+    default=None,
+    help="FlashMap, HF export: tokens of --draft-vocab to draft over (default 65536).",
+)
 @click.pass_context
 def export(
     ctx: click.Context,
@@ -291,6 +311,9 @@ def export(
     vocab_mapping: Optional[str],
     embedding_source: Optional[str],
     embedding_key: str,
+    target_model: Optional[str],
+    draft_vocab: Optional[str],
+    draft_vocab_size: Optional[int],
 ) -> int:
     """Materialize a runtime checkpoint as a model directory."""
     if target == "hf":
@@ -303,10 +326,19 @@ def export(
             vocab_mapping_path=vocab_mapping,
             embedding_source=embedding_source,
             embedding_key=embedding_key,
+            target_model=target_model,
+            draft_vocab=draft_vocab,
+            draft_vocab_size=draft_vocab_size,
         )
         return 0
     if embedding_source is not None:
         raise click.UsageError("--embedding-source is only valid with --to hf", ctx)
+    if target_model or draft_vocab or draft_vocab_size:
+        raise click.UsageError(
+            "--target-model, --draft-vocab and --draft-vocab-size are only valid "
+            "with --to hf",
+            ctx,
+        )
     from specforge.export.to_sglang import export_to_sglang
 
     export_to_sglang(
