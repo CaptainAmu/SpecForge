@@ -5,8 +5,10 @@ worker (ported from DeepSpec's sglang_dflashier_tree.py).
 Opt-in with ``FLASHMAP_TREE_N=<N>`` on a FlashMap server, with
 ``SGLANG_DSPARK_FOLDED_PROPOSAL=0`` (the tree path does its own proposal), a
 target attention backend that honours a tree mask (``fa3``, ``flashinfer`` or
-``triton``) and ``--page-size 1``. Greedy decoding only: a batch with a
-sampling request raises.
+``triton``) and ``--page-size 1``. Greedy decoding only: the scheduler refuses
+a request that samples (temperature > 0), asks for logprobs or constrains its
+output (JSON schema, regex, EBNF, structural tag) when it arrives, with an error
+response saying why (``tree_refusal``); the server keeps serving.
 
 Each decode step, replacing DSPARK's chain step:
 
@@ -48,7 +50,7 @@ if TREE_ENABLED or SPLITKV_ENABLED:
 
     from sglang.srt.layers.attention import flashattention_backend, triton_backend
     from sglang.srt.lora.layers import unwrap_lora_layer
-    from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sglang.srt.speculative import dflash_utils
     from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -97,6 +99,32 @@ def _install_splitkv() -> None:
     triton_backend.TritonAttnBackend.__init__ = init
 
 
+_CONSTRAINTS = ("json_schema", "regex", "ebnf", "structural_tag")
+
+
+def tree_refusal(req):
+    """Why a tree-mode server refuses ``req`` (an sglang ``Req``), or None.
+
+    The tree verify walks the target's argmax, so it serves greedy requests
+    only; a request that samples, asks for logprobs or constrains its output is
+    refused when it arrives rather than failing the batch it would join."""
+    params = req.sampling_params
+    asks = []
+    if params.top_k > 1:  # sglang's greedy is top_k 1 (temperature 0)
+        asks.append("sampling (temperature > 0)")
+    if req.return_logprob:
+        asks.append("logprobs")
+    if any(getattr(params, name, None) for name in _CONSTRAINTS):
+        asks.append("constrained decoding")
+    if not asks:
+        return None
+    return (
+        "this server drafts FlashMap trees (FLASHMAP_TREE_N), which serve greedy "
+        f"requests (temperature 0) only; the request asks for {' and '.join(asks)}. "
+        "Send it with temperature 0, or serve without FLASHMAP_TREE_N."
+    )
+
+
 def _install_tree() -> None:
     # Capture the target's verify graphs with a custom-mask buffer on the
     # backends that read one (DSPARK otherwise captures them mask-free).
@@ -125,6 +153,24 @@ def _install_tree() -> None:
         return _forward_decode_tree(self, batch, on_publish)
 
     dspark_worker_v2.DSparkWorkerV2._forward_decode = _forward_decode
+
+    # Refuse what the tree verify cannot serve when it arrives: every request
+    # (new, or out of the grammar queue) enters the waiting queue here. An
+    # aborted request is still run once (a one-token prefill, and with overlap
+    # scheduling possibly one decode step) before its error is returned, so it
+    # is also made greedy (aborting already drops its grammar and logprobs):
+    # every batch it joins stays one the tree step serves.
+    add_request_to_queue = Scheduler._add_request_to_queue
+
+    def _add_request_to_queue(self, req, is_retracted: bool = False):
+        if not is_retracted and not req.finished():
+            refusal = tree_refusal(req)
+            if refusal is not None:
+                req.set_finish_with_abort(refusal)
+                req.sampling_params.top_k = 1
+        return add_request_to_queue(self, req, is_retracted)
+
+    Scheduler._add_request_to_queue = _add_request_to_queue
 
 
 def _tree_state(self):
@@ -190,10 +236,10 @@ def _forward_decode_tree(self, batch, on_publish):
         or batch.return_logprob
         or not (sampling_info is None or sampling_info.is_all_greedy)
     ):
-        # Falling back to DSPARK's chain step is not safe: tried with greedy
-        # logprob requests, it broke their outputs on a tree-mode server
-        # (whether through the tree-mode verify setup or DSPARK's logprob path
-        # is not yet known), so such requests are refused.
+        # The scheduler refuses such requests on arrival (tree_refusal), so
+        # this is unreachable. Falling back to DSPARK's chain step is not safe:
+        # tried with greedy logprob requests, it broke their outputs on a
+        # tree-mode server.
         raise NotImplementedError(
             "FlashMap tree verify (FLASHMAP_TREE_N) serves greedy requests "
             "(temperature 0) without grammar or logprobs only"

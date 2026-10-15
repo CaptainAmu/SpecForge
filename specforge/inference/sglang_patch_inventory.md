@@ -109,5 +109,9 @@ depends on these 0.5.20 internals:
 | `DsparkDraftSampler` fields (`out`, `corrected_out`, `temperatures`, `greedy_mask`, `_tp_sync`, ...), asserted when taken over | the folded sampler's buffers may change |
 | `VanillaMarkov` (subclassed as an identity head), `SampleStepTokens`, `SpecTpSyncSite` | sampling helpers may move |
 | `sgl_kernel.flash_attn.flash_attn_with_kvcache` / `get_scheduler_metadata` with paged KV | FlashAttention binding may change |
+| Tree drafting only (`FLASHMAP_TREE_N`): `DSparkWorkerV2._forward_decode` (replaced by the tree step), `FlashAttentionBackend.__init__` and `dflash_utils._DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS` (tree masks on the target), `TritonAttnBackend.__init__` (`FLASHMAP_SPLITKV_VERIFY`), `Scheduler._add_request_to_queue` (refuses non-greedy, logprob and constrained requests on arrival), `build_tree_kernel_efficient` / `verify_tree_greedy_func` | worker, backend and scheduler internals may change |
+
+The standalone `flashmap` package (`flashmap[sglang]`, an SGLang plugin) carries
+the same integration and depends on the same internals.
 
 Serving docs: `docs/sections/basic_usage/flashmap_sglang.md`.

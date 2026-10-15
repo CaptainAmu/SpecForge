@@ -238,3 +238,27 @@ class TestBuildTree(unittest.TestCase):
         # Request 1: one chain of four nodes, padded with a copy of the first.
         self.assertEqual(tokens[1].tolist(), [1, 1, 1, 1, 1])
         self.assertEqual(parents[1], [0, 1, 2, 3, 0])
+
+
+class TestTreeRefusal(unittest.TestCase):
+    """A tree-mode server refuses what its greedy tree verify cannot serve."""
+
+    @staticmethod
+    def _req(top_k=1, return_logprob=False, **constraints):
+        from types import SimpleNamespace
+
+        params = SimpleNamespace(
+            top_k=top_k, json_schema=None, regex=None, ebnf=None, structural_tag=None
+        )
+        params.__dict__.update(constraints)
+        return SimpleNamespace(sampling_params=params, return_logprob=return_logprob)
+
+    def test_greedy_served_others_refused(self):
+        from specforge.serving.sglang.flashmap_tree_worker import tree_refusal
+
+        self.assertIsNone(tree_refusal(self._req()))
+        self.assertIn("sampling", tree_refusal(self._req(top_k=1 << 30)))
+        self.assertIn("logprobs", tree_refusal(self._req(return_logprob=True)))
+        self.assertIn("constrained", tree_refusal(self._req(regex="a+")))
+        both = tree_refusal(self._req(top_k=20, json_schema="{}"))
+        self.assertIn("sampling (temperature > 0) and constrained", both)
