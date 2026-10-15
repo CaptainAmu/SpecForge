@@ -293,6 +293,11 @@ class FSDPTrainingBackend(TrainingBackend):
                 )
                 if ignored_frozen_modules:
                     fsdp_kwargs["ignored_modules"] = ignored_frozen_modules
+                # Sharded FSDP flattens parameter data; the optimizer's
+                # weight-decay grouping needs the shapes as built.
+                from specforge.optimizer import record_parameter_shapes
+
+                record_parameter_shapes(model)
                 if block_classes:
                     fsdp_kwargs.update(
                         auto_wrap_policy=functools.partial(

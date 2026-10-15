@@ -35,6 +35,22 @@ def _sum_of_squares(tensors):
     return torch.stack([tensor.float().square().sum() for tensor in tensors]).sum()
 
 
+def record_parameter_shapes(module: torch.nn.Module) -> None:
+    """Remember each parameter's shape before FSDP wraps ``module``.
+
+    FSDP (``use_orig_params=True`` with a sharded strategy) keeps the parameter
+    objects but turns their data into flat 1-D views of this rank's shard, so a
+    shape read after wrapping says nothing about a weight matrix. The optimizer's
+    weight-decay grouping reads the recorded shape instead."""
+    for param in module.parameters():
+        param._specforge_shape = tuple(param.shape)
+
+
+def _is_matrix(param: torch.Tensor) -> bool:
+    """Whether ``param`` is (or, before FSDP flattened it, was) at least 2-D."""
+    return len(getattr(param, "_specforge_shape", param.shape)) >= 2
+
+
 class BF16Optimizer:
     """AdamW over fp32 master copies of the bf16 trainable params, with grad
     clipping and configurable warmup scheduling."""
@@ -112,8 +128,9 @@ class BF16Optimizer:
 
     def _param_groups(self, weight_decay, decay_matrices_only):
         """With ``decay_matrices_only``, biases, norm gains and embedding tables
-        are not decayed. Without decay there is one group, the layout every
-        earlier checkpoint was saved with."""
+        are not decayed: only parameters that are at least 2-D in the model as
+        built (see :func:`record_parameter_shapes`) are. Without decay there is
+        one group, the layout every earlier checkpoint was saved with."""
         if weight_decay == 0 or not decay_matrices_only:
             return self.fp32_params
         embeddings = {
@@ -123,7 +140,7 @@ class BF16Optimizer:
         }
         decay, no_decay = [], []
         for param, master in zip(self.model_params, self.fp32_params):
-            if param.ndim < 2 or id(param) in embeddings:
+            if not _is_matrix(param) or id(param) in embeddings:
                 no_decay.append(master)
             else:
                 decay.append(master)
