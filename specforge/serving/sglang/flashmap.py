@@ -64,7 +64,6 @@ draft KV pool, an unpadded target vocabulary without muP logit scaling.
 from __future__ import annotations
 
 import logging
-import math
 import os
 from typing import Iterable, Optional, Tuple
 
@@ -91,6 +90,11 @@ from sglang.srt.runtime_context import get_exec, get_model  # noqa: E402
 from sglang.srt.speculative.dspark_components import dspark_worker_v2  # noqa: E402
 from torch import nn  # noqa: E402
 
+from specforge.modeling.draft.flashmap import FlashMapConfig  # noqa: E402
+from specforge.modeling.draft.flashmap import rope_freqs  # noqa: E402
+from specforge.modeling.draft.flashmap import (  # noqa: E402
+    FlashMapDraftModel as FlashMapDiT,
+)
 from specforge.serving.sglang.flashmap_jump_bank import (  # noqa: E402
     JumpNoiseBank,
     top_predictions,
@@ -164,99 +168,6 @@ def _server_setting(read, default):
     return default if value is None else value
 
 
-def rope_freqs(positions: torch.Tensor, head_dim: int, base: float) -> torch.Tensor:
-    """Positions ``(...)`` -> ``(..., head_dim // 2, [cos, sin])`` in float32;
-    RoPE rotates interleaved pairs of channels ``(2i, 2i + 1)``."""
-    inv_freq = 1.0 / (
-        base
-        ** (torch.arange(0, head_dim, 2, device=positions.device).float() / head_dim)
-    )
-    angles = positions.float()[..., None] * inv_freq
-    return torch.stack([angles.cos(), angles.sin()], dim=-1)
-
-
-def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """FlashMap's RMSNorm, ``x * bf16(weight * rsqrt(mean(x^2) + eps))``, with a
-    float32 ``weight`` (torch version of ``flashmap_kernels.rms_norm``)."""
-    mean_sq = x.float().pow(2).mean(dim=-1, keepdim=True)
-    return x * (weight * torch.rsqrt(mean_sq + eps)).to(x.dtype)
-
-
-def _timestep_embedding(t: torch.Tensor, dim: int, max_period: float = 10000.0):
-    half = dim // 2
-    freqs = torch.exp(
-        -math.log(max_period)
-        * torch.arange(half, dtype=torch.float32, device=t.device)
-        / half
-    )
-    args = t.float()[..., None] * freqs
-    return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-
-
-class _Norm(nn.Module):
-    """FlashMap's RMSNorm (most are applied by the fused kernels instead)."""
-
-    def __init__(self, dim: int, eps: float):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim), requires_grad=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _rms_norm(x, self.weight.float(), self.eps)
-
-
-class _TimeEmbedding(nn.Module):
-    def __init__(self, embed_dim: int, cond_dim: int):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.linear_1 = nn.Linear(embed_dim, cond_dim)
-        self.linear_2 = nn.Linear(cond_dim, cond_dim)
-
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        emb = _timestep_embedding(t, self.embed_dim).to(self.linear_1.weight.dtype)
-        return self.linear_2(F.silu(self.linear_1(emb)))
-
-
-class _AdaLN(nn.Module):
-    """AdaLN-zero's conditioning projection: ``(scale, shift, gate)``."""
-
-    def __init__(self, dim: int, cond_dim: int):
-        super().__init__()
-        self.linear = nn.Linear(cond_dim, 3 * dim)
-
-    def forward(self, cond: torch.Tensor):
-        return self.linear(F.silu(cond)).chunk(3, dim=-1)
-
-
-class _Attention(nn.Module):
-    def __init__(self, dim: int, heads: int, eps: float):
-        super().__init__()
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        self.o_proj = nn.Linear(dim, dim, bias=False)
-        self.q_norm = _Norm(dim // heads, eps)
-        self.k_norm = _Norm(dim // heads, eps)
-
-
-class _MLP(nn.Module):
-    def __init__(self, dim: int, hidden: int):
-        super().__init__()
-        self.fc1 = nn.Linear(dim, hidden)
-        self.fc2 = nn.Linear(hidden, dim)
-
-
-class _Layer(nn.Module):
-    def __init__(self, dim: int, heads: int, mlp_dim: int, cond_dim: int, eps: float):
-        super().__init__()
-        self.self_attn_adaln = _AdaLN(dim, cond_dim)
-        self.self_attn = _Attention(dim, heads, eps)
-        self.cross_attn_adaln = _AdaLN(dim, cond_dim)
-        self.cross_attn = _Attention(dim, heads, eps)
-        self.mlp_adaln = _AdaLN(dim, cond_dim)
-        self.mlp = _MLP(dim, mlp_dim)
-
-
 class _FoldedHead(nn.Module):
     """The draft's head as DSPARK reads it: the DiT head folded into the
     target's LM head over the draft vocabulary. ``org_vocab_size`` is the full
@@ -269,57 +180,35 @@ class _FoldedHead(nn.Module):
         self.org_vocab_size = int(vocab_size)
 
 
-class FlashMapDraftModel(nn.Module):
+class FlashMapDraftModel(FlashMapDiT):
+    """The training FlashMap DiT (``specforge.modeling.draft.flashmap``), whose
+    weights, release names and modules it serves, with sglang's draft protocol
+    and the fused draft step below."""
+
     # Read by the DSPARK worker and the hooks below.
     flashmap = True
     uses_own_vocab_modules = False
     supports_pre_gather_target_hidden_projection = False
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
-        super().__init__()
         del quant_config, prefix
-        self.config = config
-        fm = dict(config.flashmap_config)
-        self.vocab_size = int(fm["vocab_size"])
-        self.target_hidden_size = int(fm["target_hidden_size"])
-        self.dim = int(fm["hidden_size"])
-        self.num_heads = int(fm["num_attention_heads"])
-        self.head_dim = self.dim // self.num_heads
-        self.block_size = self.gamma = int(fm["block_size"])
-        self.num_stages = int(fm["num_hidden_layers"])
-        self.rope_theta = float(fm["rope_theta"])
-        self.time_scale = float(fm["time_scale"])
-        self.rms_norm_eps = float(fm["rms_norm_eps"])
-        self.qk_norm_eps = float(fm["qk_norm_eps"])
-        self.layer_norm_eps = float(fm["layer_norm_eps"])
-        assert fm["noise_gate"] == "jump", fm["noise_gate"]
-        cond_dim = int(fm["cond_dim"])
-        context_features = len(fm["target_layer_ids"]) * self.target_hidden_size
-
-        # The released weights, under their release names.
-        self.fc = nn.Linear(context_features, self.dim, bias=False)
-        eps = self.rms_norm_eps
-        self.hidden_norm = _Norm(self.dim, eps)
-        self.anchor_proj = nn.Linear(self.target_hidden_size, self.dim)
-        self.anchor_norm = _Norm(self.dim, eps)
-        self.state_norm = _Norm(self.target_hidden_size, eps)
-        self.noise_norm = _Norm(self.target_hidden_size, eps)
-        self.noise_gate = nn.Parameter(torch.zeros(1), requires_grad=False)
-        self.x_embed = nn.Linear(self.target_hidden_size, self.dim)
-        self.time_embed = _TimeEmbedding(int(fm["time_embed_dim"]), cond_dim)
-        self.jump_embed = _TimeEmbedding(int(fm["time_embed_dim"]), cond_dim)
-        self.layers = nn.ModuleList(
-            _Layer(
-                self.dim,
-                self.num_heads,
-                int(fm["intermediate_size"]),
-                cond_dim,
-                self.qk_norm_eps,
-            )
-            for _ in range(self.num_stages)
-        )
-        self.final_adaln = _AdaLN(self.dim, cond_dim)
-        self.head = nn.Linear(self.dim, self.target_hidden_size)
+        release = dict(config.flashmap_config)
+        release.pop("model_type", None)
+        super().__init__(FlashMapConfig(**release))
+        assert self.flow_map, "sglang serves a flow map, not its stage-1 flow"
+        self.serving_config = config  # the export's sglang config
+        fm = self.config
+        self.vocab_size = fm.vocab_size
+        self.target_hidden_size = fm.target_hidden_size
+        self.dim = fm.hidden_size
+        self.num_heads = fm.num_attention_heads
+        self.gamma = self.block_size
+        self.num_stages = fm.num_hidden_layers
+        self.rope_theta = fm.rope_theta
+        self.time_scale = fm.time_scale
+        self.rms_norm_eps = fm.rms_norm_eps
+        self.qk_norm_eps = fm.qk_norm_eps
+        self.layer_norm_eps = fm.layer_norm_eps
 
         # DSPARK's draft protocol.
         self.sample_from_anchor = True
@@ -331,8 +220,8 @@ class FlashMapDraftModel(nn.Module):
         self.hot_ids = None  # draft vocabulary -> token ids (None: all tokens)
         self.folded_head = None
 
-        self.num_steps = int(os.environ.get("FLASHMAP_NUM_STEPS") or fm["num_steps"])
-        self.grid = [float(t) for t in fm["jump_grids"][str(self.num_steps)]]
+        self.num_steps = int(os.environ.get("FLASHMAP_NUM_STEPS") or fm.num_steps)
+        self.grid = [float(t) for t in fm.jump_grids[str(self.num_steps)]]
         assert self.grid[0] == 0.0 and self.grid[-1] == 1.0, self.grid
         self.jump_bank_size = int(os.environ.get("FLASHMAP_JUMP_BANK", "8192"))
         self.jump_topk = int(os.environ.get("FLASHMAP_JUMP_TOPK", "16"))
@@ -375,7 +264,7 @@ class FlashMapDraftModel(nn.Module):
     # --- loading -----------------------------------------------------------
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
-        params = dict(self.named_parameters())
+        params = {**dict(self.named_parameters()), **dict(self.named_buffers())}
         loaded = set()
         for name, tensor in weights:
             if name == "draft_vocab_ids":
@@ -523,11 +412,13 @@ class FlashMapDraftModel(nn.Module):
                     layer.cross_attn_adaln,
                     layer.mlp_adaln,
                 )
-                chunks = [adaln(cond) for adaln in adalns]
+                chunks = [
+                    adaln.linear(F.silu(cond)).chunk(3, dim=-1) for adaln in adalns
+                ]
                 modulations.append(
                     tuple((1 + scale, shift, gate) for scale, shift, gate in chunks)
                 )
-            scale, shift, _ = self.final_adaln(cond)
+            scale, shift, _ = self.final_adaln.linear(F.silu(cond)).chunk(3, dim=-1)
             per_jump.append((modulations, (1 + scale, shift)))
         embedding = self.embedding
         posterior = torch.full(
@@ -692,7 +583,7 @@ class FlashMapDraftModel(nn.Module):
         # server can reach (the fused kernel does not bound-check).
         context_length = _server_setting(lambda: get_model().context_length, 0)
         max_positions = (
-            max(int(self.config.max_position_embeddings), int(context_length))
+            max(int(self.serving_config.max_position_embeddings), int(context_length))
             + self.block_size
             + 1
         )
@@ -878,7 +769,7 @@ class FlashMapDraftModel(nn.Module):
                 context.reshape(bsz, block_size, self.dim)
             )
             normed = F.layer_norm(hidden, (self.dim,), eps=eps) * m_scale + m_shift
-            hidden = hidden + m_gate * layer.mlp.fc2(F.gelu(layer.mlp.fc1(normed)))
+            hidden = hidden + m_gate * layer.mlp(normed)
         return F.layer_norm(hidden, (self.dim,), eps=eps) * final_scale + final_shift
 
 

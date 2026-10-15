@@ -27,7 +27,6 @@ import os
 from types import SimpleNamespace
 
 import torch
-import torch.nn.functional as F
 from safetensors import safe_open
 from transformers import AutoConfig
 
@@ -82,87 +81,34 @@ def target_vocab_weights(target: str, device: str = "cuda"):
     return out
 
 
-def rms_norm(x, weight, eps):
-    mean_sq = x.float().pow(2).mean(-1, keepdim=True)
-    return x * (weight.float() * torch.rsqrt(mean_sq + eps)).to(x.dtype)
-
-
-def rope(x, positions, base):
-    """Interleaved-pair RoPE of ``x (T, heads, head_dim)`` at ``positions (T,)``."""
-    head_dim = x.shape[-1]
-    inv_freq = 1.0 / (
-        base ** (torch.arange(0, head_dim, 2, device=x.device).float() / head_dim)
-    )
-    angles = positions.float()[:, None, None] * inv_freq
-    pairs = x.float().reshape(*x.shape[:-1], -1, 2)
-    out = torch.stack(
-        [
-            pairs[..., 0] * angles.cos() - pairs[..., 1] * angles.sin(),
-            pairs[..., 1] * angles.cos() + pairs[..., 0] * angles.sin(),
-        ],
-        dim=-1,
-    )
-    return out.flatten(-2).to(x.dtype)
-
-
 @torch.no_grad()
 def reference_logits(draft, embed, lm_head, hidden, anchor, noise_embed, start, end):
     """The map's logits for one block after ``hidden (T, features)`` and the
     anchor token at position T, from the embedded noise ``noise_embed (K, H)``
-    (= x @ E), for a jump from ``start`` to ``end``: written out directly."""
-    fm = draft.config.flashmap_config
-    eps, qk_eps, ln_eps = fm["rms_norm_eps"], fm["qk_norm_eps"], fm["layer_norm_eps"]
-    heads, theta = fm["num_attention_heads"], fm["rope_theta"]
+    (= x @ E), for a jump from ``start`` to ``end``, by the training model's
+    own forward (every attention over the whole context, no fused kernels)."""
+    from specforge.modeling.draft.flashmap import FlashMapDraftModel as FlashMapDiT
+
     length, block = hidden.shape[0], draft.block_size
-    context = torch.cat(
-        [
-            rms_norm(draft.fc(hidden), draft.hidden_norm.weight, eps),
-            rms_norm(
-                draft.anchor_proj(embed[anchor].view(1, -1)),
-                draft.anchor_norm.weight,
-                eps,
-            ),
-        ]
+    # [the T context rows, the anchor at position T]
+    context = draft.embed_context(hidden[None], embed[anchor].view(1, 1, -1))
+    context_kv = draft.project_context(
+        context, torch.arange(length + 1, device=DEVICE)[None]
     )
-    ctx_positions = torch.arange(length + 1, device=DEVICE)
-    positions = length + 1 + torch.arange(block, device=DEVICE)
     vocab = embed.shape[0]
     uniform = torch.full((1, vocab), 1.0 / vocab, device=DEVICE).to(embed.dtype) @ embed
     gate = draft.noise_gate * (end - start)
-    state = rms_norm(uniform, draft.state_norm.weight, eps) + gate * rms_norm(
-        noise_embed, draft.noise_norm.weight, eps
+    state = draft.state_norm(uniform) + gate * draft.noise_norm(noise_embed)
+    times = torch.full((1, block), 1.0, device=DEVICE)
+    out = FlashMapDiT.forward(
+        draft,
+        state[None],
+        times * start,
+        length + 1 + torch.arange(block, device=DEVICE)[None],
+        context_kv,
+        end=times * end,
     )
-    times = torch.tensor([start, end], device=DEVICE) * fm["time_scale"]
-    cond = draft.time_embed(times[:1]) + draft.jump_embed(times[1:])
-
-    def modulate(x, adaln):
-        scale, shift, gate = adaln(cond)
-        return F.layer_norm(x, (x.shape[-1],), eps=ln_eps) * (1 + scale) + shift, gate
-
-    def attention(attn, x, kv, q_positions, kv_positions):
-        dim = x.shape[-1]
-        q = attn.q_proj(x).view(-1, heads, dim // heads)
-        k = attn.k_proj(kv).view(-1, heads, dim // heads)
-        v = attn.v_proj(kv).view(-1, heads, dim // heads)
-        q = rope(rms_norm(q, attn.q_norm.weight, qk_eps), q_positions, theta)
-        k = rope(rms_norm(k, attn.k_norm.weight, qk_eps), kv_positions, theta)
-        out = F.scaled_dot_product_attention(
-            q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
-        )
-        return attn.o_proj(out.transpose(0, 1).reshape(-1, dim))
-
-    h = draft.x_embed(state)
-    for layer in draft.layers:
-        normed, gate = modulate(h, layer.self_attn_adaln)
-        h = h + gate * attention(layer.self_attn, normed, normed, positions, positions)
-        normed, gate = modulate(h, layer.cross_attn_adaln)
-        h = h + gate * attention(
-            layer.cross_attn, normed, context, positions, ctx_positions
-        )
-        normed, gate = modulate(h, layer.mlp_adaln)
-        h = h + gate * layer.mlp.fc2(F.gelu(layer.mlp.fc1(normed)))
-    normed, _ = modulate(h, draft.final_adaln)
-    return draft.head(normed) @ lm_head.T
+    return out[0] @ lm_head.T
 
 
 def main():

@@ -38,6 +38,8 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
+from specforge.modeling.draft.flashmap import FlashMapConfig
+
 ARCHITECTURE = "FlashMapDraftModel"
 DEFAULT_DRAFT_VOCAB_SIZE = 65536
 # The ranking a release folder ships (key "ids": every token id, most frequent first).
@@ -68,14 +70,6 @@ _GLOBAL_WEIGHTS = (
     "jump_embed.linear_2.bias", "final_adaln.linear.weight",
     "final_adaln.linear.bias", "head.weight", "head.bias",
 )  # fmt: skip
-# Jump grids of the "decoding_error" time schedule at Qwen3's vocabulary size
-# (endpoints exactly 0 and 1), for DeepSpec sources, whose configs lack them.
-QWEN3_JUMP_GRIDS = {
-    "1": [0.0, 1.0],
-    "2": [0.0, 0.8172569274902344, 1.0],
-    "3": [0.0, 0.8010796308517456, 0.8310279846191406, 1.0],
-    "4": [0.0, 0.7906050682067871, 0.8172569274902344, 0.8379518389701843, 1.0],
-}
 _DEEPSPEC_MAPS = (
     "Qwen3DFlashierSemigroupFlowMapModel",
     "Qwen3DFlashierSolverFlowMapModel",
@@ -143,7 +137,6 @@ def from_deepspec(src: str):
         ("time_schedule", "decoding_error"),
     ):
         assert source.get(key) == value, (key, source.get(key))
-    assert int(source["vocab_size"]) == 151936, "jump grids are Qwen3's"
     dim = int(source["dit_embed_dim"])
     config = dict(
         model_type="flashmap",
@@ -166,7 +159,7 @@ def from_deepspec(src: str):
         noise_gate="jump",
         time_schedule="decoding_error",
         num_steps=1,
-        jump_grids=QWEN3_JUMP_GRIDS,
+        jump_grids=FlashMapConfig(vocab_size=int(source["vocab_size"])).jump_grids,
         max_position_embeddings=int(source.get("max_position_embeddings", 40960)),
         num_target_layers=int(source.get("num_target_layers", 0)) or None,
     )
