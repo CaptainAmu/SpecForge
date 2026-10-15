@@ -358,3 +358,100 @@ def kv_norm_rope_write_fp8(
 
 
 __all__ += ["kv_norm_rope_write_fp8"]
+
+
+@triton.jit
+def _tree_commit_kernel(
+    accept_ptr,  # (bs, D1) int32: global node ids of the accepted path, root first; -1 past it
+    num_correct_ptr,  # (bs,) int32: accepted drafts
+    window_ptr,  # (bs, W) int64: the verify window's KV slots, node order
+    predict_ptr,  # (bs * W,) int32: the target's token after each node on the path
+    req_pool_ptr,  # (bs,) int64
+    prefix_ptr,  # (bs,) int64: committed length before this step
+    req_to_token_ptr,  # (rows, row_stride) int32
+    row_stride,
+    out_tokens_ptr,  # (bs, D1) int64
+    bonus_ptr,  # (bs,) int64
+    commit_ptr,  # (bs,) int32
+    new_seq_lens_ptr,  # (bs,) int64
+    inject_loc_ptr,  # (bs * W,) int64
+    W: tl.constexpr,
+    D1: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # One program per request: the tree path's commit in one launch.
+    b = tl.program_id(0)
+    n = tl.load(num_correct_ptr + b)
+    j = tl.arange(0, BLOCK)  # path positions
+    i = tl.arange(0, BLOCK)  # tree nodes
+    on_path_j = j <= n
+    node = tl.load(accept_ptr + b * D1 + j, mask=(j < D1) & on_path_j, other=0) - b * W
+    node = tl.where(on_path_j & (j < D1), node, -1)
+    # Which nodes the path takes (node i at path position j).
+    hit = (node[:, None] == i[None, :]) & (node[:, None] >= 0)
+    on_path = tl.sum(hit.to(tl.int32), axis=0) > 0
+    in_tree = i < W
+    window = tl.load(window_ptr + b * W + i, mask=in_tree, other=0)
+    # Reorder the window's req_to_token entries: the path first (where its KV
+    # is), then every other node in index order.
+    off_path = (on_path == 0) & in_tree
+    rank = tl.cumsum(off_path.to(tl.int32), axis=0) - 1
+    row = tl.load(req_pool_ptr + b)
+    prefix = tl.load(prefix_ptr + b)
+    base = req_to_token_ptr + row * row_stride + prefix
+    path_slot = tl.load(window_ptr + b * W + node, mask=node >= 0, other=0)
+    tl.store(base + j, path_slot.to(tl.int32), mask=node >= 0)
+    tl.store(base + n + 1 + rank, window.to(tl.int32), mask=off_path)
+    # The path's tokens (the drafts, then the target's next one) and the bonus.
+    token = tl.load(predict_ptr + b * W + node, mask=node >= 0, other=0).to(tl.int64)
+    tl.store(out_tokens_ptr + b * D1 + j, token, mask=j < D1)
+    tl.store(bonus_ptr + b, tl.sum(tl.where(j == n, token, 0), axis=0))
+    tl.store(commit_ptr + b, n + 1)
+    tl.store(new_seq_lens_ptr + b, prefix + n + 1)
+    # Draft context goes where the path's KV is; other rows to dummy slot 0.
+    tl.store(inject_loc_ptr + b * W + i, tl.where(on_path, window, 0), mask=in_tree)
+
+
+def tree_commit(
+    accept_index,
+    num_correct,
+    window,
+    predict,
+    req_pool_indices,
+    prefix_lens,
+    req_to_token,
+):
+    """The tree path's commit after verify_tree_greedy, one launch for the batch.
+    Reorders each request's verify window in req_to_token so the accepted path
+    comes first (no KV moves) and returns (out_tokens (bs, D1) int64, bonus,
+    commit_lens int32, new_seq_lens, inject_locs (bs * W) int64)."""
+    bs, d1 = accept_index.shape
+    width = window.shape[1]
+    device = accept_index.device
+    out_tokens = torch.empty((bs, d1), dtype=torch.int64, device=device)
+    bonus = torch.empty((bs,), dtype=torch.int64, device=device)
+    commit = torch.empty((bs,), dtype=torch.int32, device=device)
+    new_seq_lens = torch.empty((bs,), dtype=prefix_lens.dtype, device=device)
+    inject_locs = torch.empty((bs * width,), dtype=torch.int64, device=device)
+    _tree_commit_kernel[(bs,)](
+        accept_index,
+        num_correct,
+        window,
+        predict,
+        req_pool_indices,
+        prefix_lens,
+        req_to_token,
+        req_to_token.stride(0),
+        out_tokens,
+        bonus,
+        commit,
+        new_seq_lens,
+        inject_locs,
+        W=width,
+        D1=d1,
+        BLOCK=triton.next_power_of_2(max(width, d1)),
+    )
+    return out_tokens, bonus, commit, new_seq_lens, inject_locs
+
+
+__all__ += ["tree_commit"]

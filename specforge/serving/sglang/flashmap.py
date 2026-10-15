@@ -111,6 +111,7 @@ from specforge.serving.sglang.flashmap_sampler import (  # noqa: E402
     FlashMapDraftSampler,
     IdentityMarkov,
 )
+from specforge.serving.sglang.flashmap_tree import build_tree_abi  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +278,17 @@ class FlashMapDraftModel(FlashMapDiT):
         self._fp8 = {}
         self._constants = None
         self._fused_write = None  # (pool id, kernel arguments)
+        # Tree drafting (flashmap_tree_worker.py): up to FLASHMAP_TREE_N candidate
+        # blocks per request from independent noise in one draft pass, merged
+        # into a trie cut to the verify width (block_size + 1 with the root); a
+        # batch of bs requests drafts clamp(FLASHMAP_TREE_BUDGET // bs, 1, N).
+        self.tree_max_n = int(os.environ.get("FLASHMAP_TREE_N", "0"))
+        self.tree_budget = int(os.environ.get("FLASHMAP_TREE_BUDGET", "32"))
+        self.tree_mode = self.tree_max_n >= 1
+        self.tree_width = self.block_size + 1
+        self._tree_buffers = None
+        self._tree_scratch = None
+        self._build_tree = build_tree_abi
         self._kv_fp8 = False  # an e4m3 draft KV pool (set with the pool)
         self._draft = self._draft_impl
         self._anchor_kv = self._anchor_kv_impl
@@ -296,6 +308,8 @@ class FlashMapDraftModel(FlashMapDiT):
                 )
             self._draft = torch.compile(self._draft_impl, dynamic=True, mode=mode)
             self._anchor_kv = torch.compile(self._anchor_kv_impl, dynamic=True)
+            # ~50 small index ops per step otherwise, inside the draft graph.
+            self._build_tree = torch.compile(build_tree_abi, dynamic=True)
         logger.info(
             "FlashMap draft: %d jump(s) on %s, block_size=%d, draft vocabulary %s",
             self.num_steps,
@@ -403,6 +417,10 @@ class FlashMapDraftModel(FlashMapDiT):
         if self.fp8:
             self._quantize_fp8()
         self._constants = self._jump_constants()
+        if self.tree_mode:
+            if self.num_steps != 1:
+                raise NotImplementedError("tree drafting takes one jump")
+            self._tree_buffers = self._alloc_tree_buffers(self._graph_max_bs())
         if self.num_steps > 1:
             self.jump_bank = JumpNoiseBank(
                 self,
@@ -544,6 +562,70 @@ class FlashMapDraftModel(FlashMapDiT):
         proj = (fold @ self.x_embed.weight.double().T).to(self.embedding.dtype)
         variance = (lam / self.target_hidden_size).float()
         return variance, proj, self.x_embed(uniform)
+
+    @staticmethod
+    def _graph_max_bs() -> int:
+        return _server_setting(
+            lambda: get_exec().graph.cuda_graph_config.decode.max_bs, 64
+        )
+
+    def _alloc_tree_buffers(self, max_bs: int):
+        """The tree a draft step hands to verification, in EAGLE's encoding
+        (build_tree_kernel_efficient): per request its W - 1 non-root nodes'
+        tokens and ids ``parent * W + index``, the parent list, and (trie nodes,
+        distinct candidates); the draft's CUDA graphs write them in place."""
+        width, device = self.tree_width, self._ctx_kv_weight.device
+
+        def zeros(*shape):
+            return torch.zeros(*shape, dtype=torch.int64, device=device)
+
+        return (
+            zeros(max_bs, width - 1),
+            zeros(max_bs, width - 1),
+            zeros(max_bs, width * (self.block_size - 1) + 1),
+            zeros(max_bs, 2),
+        )
+
+    def tree_outputs(self, bsz: int):
+        """The tree buffers for a batch of ``bsz``: the persistent ones, which
+        captured graphs write, or (an eager batch above them) scratch ones."""
+        buffers = self._tree_buffers
+        if bsz > buffers[0].shape[0]:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"capturing a draft graph for {bsz} requests, above the tree buffers"
+                )
+            if self._tree_scratch is None or self._tree_scratch[0].shape[0] < bsz:
+                self._tree_scratch = self._alloc_tree_buffers(bsz)
+            buffers = self._tree_scratch
+        return tuple(buffer[:bsz] for buffer in buffers)
+
+    def tree_n_for(self, bsz: int) -> int:
+        """Candidates per request in a batch of ``bsz`` (fixed per captured
+        batch size, so graphs replay what they captured)."""
+        return max(1, min(self.tree_max_n, self.tree_budget // max(bsz, 1)))
+
+    # Rows of the head's logits held at once while taking the tree's argmaxes.
+    _TREE_HEAD_CHUNK = 1024
+
+    def _draft_tree(self, hidden: torch.Tensor, bsz: int, n_cand: int) -> None:
+        """Greedy tokens of every candidate, merged into a trie cut to the
+        verify width, written to the tree buffers (inside the draft graph)."""
+        rows = hidden.shape[0]
+        tokens = torch.empty(rows, dtype=torch.int64, device=hidden.device)
+        for start in range(0, rows, self._TREE_HEAD_CHUNK):
+            end = min(rows, start + self._TREE_HEAD_CHUNK)
+            tokens[start:end] = self.head_logits(hidden[start:end]).argmax(dim=-1)
+        if self.hot_ids is not None:
+            tokens = self.hot_ids[tokens]
+        out_tokens, out_ids, out_parents, out_stats = self.tree_outputs(bsz)
+        node_tokens, ids, stats = self._build_tree(
+            tokens.view(bsz, n_cand, self.block_size), self.tree_width
+        )
+        out_tokens.copy_(node_tokens)
+        out_ids.copy_(ids)
+        out_parents[:, 1 : ids.shape[1] + 1].copy_(ids)
+        out_stats.copy_(stats)
 
     def noise_gate_at(self, start: float, end: float) -> torch.Tensor:
         """The weight of the state's noise term for a jump from ``start`` to
@@ -736,8 +818,11 @@ class FlashMapDraftModel(FlashMapDiT):
             forward_batch.req_pool_indices
         ]
         cache_seqlens = (forward_batch.seq_lens + 1).to(torch.int32)
+        # Tree drafting puts a request's candidate blocks side by side in the
+        # cross-attention's query axis, so its context is read once, not N times.
+        n_cand = self.tree_n_for(bsz) if self.tree_mode else 1
         schedule = _cross_attention_schedule(
-            (bsz, block_size, self.num_heads, self.head_dim),
+            (bsz, n_cand * block_size, self.num_heads, self.head_dim),
             cache_seqlens,
             page_table,
             torch.float8_e4m3fn if self._kv_fp8 else torch.bfloat16,
@@ -749,7 +834,15 @@ class FlashMapDraftModel(FlashMapDiT):
             schedule,
             [pool.get_key_buffer(i) for i in range(self.num_stages)],
             [pool.get_value_buffer(i) for i in range(self.num_stages)],
+            n_cand,
         )
+        if self.tree_mode:
+            assert gamma == block_size, "tree drafting verifies the whole block"
+            self._draft_tree(hidden, bsz, n_cand)
+            # DSPARK's proposer expects one block per request: hand it the first
+            # candidate's (the tree path reads the trie instead).
+            hidden = hidden.view(bsz, n_cand, block_size, -1)[:, 0]
+            hidden = hidden.reshape(bsz * block_size, -1)
         if gamma < block_size:
             hidden = hidden.view(bsz, block_size, -1)[:, :gamma].reshape(
                 bsz * gamma, -1
@@ -766,16 +859,29 @@ class FlashMapDraftModel(FlashMapDiT):
         return self._linear(self.anchor_norm(anchor), "ctx_kv", self._ctx_kv_weight)
 
     def _draft_impl(
-        self, block_positions, page_table, cache_seqlens, schedule, keys, values
+        self,
+        block_positions,
+        page_table,
+        cache_seqlens,
+        schedule,
+        keys,
+        values,
+        n_cand: int = 1,
     ) -> torch.Tensor:
         """The block's ``num_steps`` jumps, a pure tensor function so it can be
-        compiled; returns the last jump's hidden states ``(bs * K, dim)``."""
+        compiled; returns the last jump's hidden states ``(bs * K, dim)``.
+
+        ``n_cand`` > 1 (one jump only, tree drafting) drafts that many blocks
+        per request from independent noise, candidate-major per request."""
         _, uniform, noise = self._constants
-        bsz, block_size = block_positions.shape
+        requests, block_size = block_positions.shape
+        bsz = requests * n_cand
         slots = bsz * block_size
         # The slots sit at anchor + 1 .. anchor + K.
         freqs = rope_freqs(block_positions + 1, self.head_dim, self.rope_theta)
-        attend = (freqs, page_table, cache_seqlens, schedule, keys, values)
+        if n_cand > 1:
+            freqs = freqs.repeat_interleave(n_cand, dim=0)
+        attend = (freqs, page_table, cache_seqlens, schedule, keys, values, n_cand)
         if self.num_steps == 1 and not self.folded_noise:
             # One jump from t = 0: the noise drawn in the embedding's space.
             z = self.noise_temperature * torch.randn(
@@ -809,6 +915,7 @@ class FlashMapDraftModel(FlashMapDiT):
             return self._denoise(0, hidden, *attend).reshape(slots, -1)
         # Banked jumps (flashmap_jump_bank.py): no vocabulary-sized state, the
         # predictions between jumps from the draft vocabulary's head.
+        assert n_cand == 1, "several candidates per request take one jump"
         bank = self.jump_bank
         rows, seeds = bank.draw(slots, block_positions.device)
         embedded = bank.first_input(self, rows, uniform)
@@ -829,7 +936,16 @@ class FlashMapDraftModel(FlashMapDiT):
         return hidden
 
     def _denoise(
-        self, step, hidden, freqs, page_table, cache_seqlens, schedule, keys, values
+        self,
+        step,
+        hidden,
+        freqs,
+        page_table,
+        cache_seqlens,
+        schedule,
+        keys,
+        values,
+        n_cand: int = 1,
     ) -> torch.Tensor:
         """One evaluation of the map at jump ``step``'s times on the embedded
         state after ``x_embed``, ``(bs, K, dim)``; returns the final AdaLN's
@@ -866,8 +982,15 @@ class FlashMapDraftModel(FlashMapDiT):
             cross_attention = (
                 _paged_cross_attention_fp8 if self._kv_fp8 else _paged_cross_attention
             )
+            # A request's candidates as one query sequence (their rows are
+            # adjacent, candidate-major).
             context = cross_attention(
-                query, keys[i], values[i], cache_seqlens, page_table, schedule
+                query.reshape(bsz // n_cand, n_cand * block_size, *shape[2:]),
+                keys[i],
+                values[i],
+                cache_seqlens,
+                page_table,
+                schedule,
             )
             context = context.reshape(bsz, block_size, self.dim)
             hidden = hidden + c_gate * self._linear(
