@@ -532,6 +532,14 @@ class FlashMapDraftModel(FlashMapPreTrainedModel):
         self.post_init()
 
     @staticmethod
+    def may_be_missing_from_checkpoint(key: str) -> bool:
+        """Export tolerates no missing weight: the draft borrows the target's
+        embedding and LM head without holding them, and its "*embed*" weights
+        (``x_embed``, ``time_embed``, ``jump_embed``) are trained."""
+        del key
+        return False
+
+    @staticmethod
     def adapt_config_to_checkpoint(config: FlashMapConfig, state_dict) -> None:
         """A flow and its map share one draft config; the weights tell which a
         checkpoint holds (only a map has the end-time embedding)."""

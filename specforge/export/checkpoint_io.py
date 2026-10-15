@@ -175,13 +175,13 @@ def materialize_draft(
             f"does not have: {sorted(unexpected)}"
         )
     tolerated = {"t2d", "d2t"} if vocab_mapping_path else set()
-    # Only the target-copied token embedding and LM head may be absent; other
-    # "*embed*" weights (e.g. FlashMap's x_embed/time_embed/jump_embed) train.
-    target_copies = {"embed_tokens", "lm_head"}
+    # A draft whose own trained weights have "embed" in their names (FlashMap's
+    # x_embed, time_embed and jump_embed) says which missing keys it tolerates.
+    may_be_missing = getattr(model, "may_be_missing_from_checkpoint", None)
+    if may_be_missing is None:
+        may_be_missing = lambda key: "embed" in key.lower()  # noqa: E731
     non_embed_missing = [
-        key
-        for key in missing
-        if target_copies.isdisjoint(key.split(".")[:-1]) and key not in tolerated
+        key for key in missing if not may_be_missing(key) and key not in tolerated
     ]
     if non_embed_missing:
         raise ValueError(
