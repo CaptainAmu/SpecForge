@@ -14,8 +14,8 @@ distributions. Two jumps cost twice as much and are more accurate.
 | Draft architecture | `FlashMapDraftModel` |
 | Online server capture | `--spec-capture-method dflash` |
 | Offline feature schema | DFlash `input_ids`, `loss_mask`, `hidden_states` |
-| Export target | `specforge export --to hf`, then `python -m specforge.export.flashmap` for SGLang |
-| SGLang serving algorithm | `DSPARK` with SpecForge's external FlashMap model ([guide](../basic_usage/flashmap_sglang.md)) |
+| Export target | `specforge export --to hf` (the FlashMap release format) |
+| SGLang serving algorithm | `DSPARK`, with the `flashmap[sglang]` plugin ([guide](../basic_usage/flashmap_sglang.md)) |
 
 FlashMap reads the same target features as DFlash, so capture servers,
 offline feature files and the collator are DFlash's, and DFlash's anchor
@@ -132,35 +132,27 @@ read by every evaluation.
 
 ## Export and serve
 
-A map checkpoint exports to the released FlashMap layout: `config.json` with
-`model_type: flashmap`, and the draft's own weights without the target's
-embedding and LM head.
+A map checkpoint exports to the FlashMap release format, the layout of the
+published FlashMap models, which the standalone `flashmap` package serves in
+SGLang (`flashmap[sglang]`) and vLLM (`flashmap[vllm]`) and loads with
+transformers:
 
 ```bash
 specforge export --to hf \
     --checkpoint ./outputs/qwen3-8b-flashmap-map-offline \
     --draft-config configs/qwen3-8b-flashmap.json \
+    --draft-vocab FlashMap-Qwen3-8B/draft_vocab.safetensors \
     --output-dir ./exports/FlashMap-Qwen3-8B
-
-python -m specforge.export.flashmap \
-    --src ./exports/FlashMap-Qwen3-8B --output-dir ./exports/FlashMap-Qwen3-8B-sglang
-
-# or both steps at once, from the training checkpoint
-specforge export --to sglang \
-    --checkpoint ./outputs/qwen3-8b-flashmap-map-offline \
-    --draft-config configs/qwen3-8b-flashmap.json \
-    --output-dir ./exports/FlashMap-Qwen3-8B-sglang
 ```
 
-Then serve the second directory as described in
-[Serving FlashMap with SGLang](../basic_usage/flashmap_sglang.md).
+`--draft-vocab` (optional) ships a ranking of the target's tokens by frequency,
+such as a published folder's `draft_vocab.safetensors` for the same target; the
+served draft predicts over its most frequent `--draft-vocab-size` tokens (65536
+by default). See [Serving FlashMap](../basic_usage/flashmap_sglang.md) for the
+folder's contents and the serving commands.
 
 The same command exports a stage-1 flow: the exporter reads from the weights
 whether a checkpoint holds a flow or a map, so the map's draft config serves
-for both, and the exported `config.json` records `flow_map`. An exported
+for both, and a flow's `config.json` records `"flow_map": false`. An exported
 directory loads back into SpecForge (`model.draft_checkpoint_path` or
-`model.flashmap_flow_checkpoint`) as it is. To load it with plain transformers
-(`trust_remote_code=True`), copy `configuration_flashmap.py` and
-`modeling_flashmap.py` from a released FlashMap model folder into it and add
-`"auto_map": {"AutoConfig": "configuration_flashmap.FlashMapConfig",
-"AutoModel": "modeling_flashmap.FlashMapDraftModel"}` to its `config.json`.
+`model.flashmap_flow_checkpoint`) as it is.

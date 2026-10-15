@@ -431,8 +431,8 @@ The checked-in examples are the canonical starting points:
 | Domino | Offline colocated | [`qwen3-8b-domino-offline.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-8b-domino-offline.yaml) |
 | DSpark | Online disaggregated, external | [`qwen3-4b-dspark-disaggregated.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-4b-dspark-disaggregated.yaml) |
 | DSpark | Offline colocated | [`qwen3-4b-dspark-offline.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-4b-dspark-offline.yaml) |
-| FlashMap | Online disaggregated, external | [`qwen3-4b-flashmap-flow-online.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-4b-flashmap-flow-online.yaml), then [`qwen3-4b-flashmap-map-online.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3-4b-flashmap-map-online.yaml) |
-| FlashMap | Offline colocated | [`qwen3-8b-flashmap-flow-offline.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-8b-flashmap-flow-offline.yaml), then [`qwen3-8b-flashmap-map-offline.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/offline/colocated/qwen3-8b-flashmap-map-offline.yaml) |
+| FlashMap | Online disaggregated, external | [`qwen3-4b-flashmap-flow-online.yaml`](../../../examples/configs/online/disaggregated/external/qwen3-4b-flashmap-flow-online.yaml), then [`qwen3-4b-flashmap-map-online.yaml`](../../../examples/configs/online/disaggregated/external/qwen3-4b-flashmap-map-online.yaml) |
+| FlashMap | Offline colocated | [`qwen3-8b-flashmap-flow-offline.yaml`](../../../examples/configs/offline/colocated/qwen3-8b-flashmap-flow-offline.yaml), then [`qwen3-8b-flashmap-map-offline.yaml`](../../../examples/configs/offline/colocated/qwen3-8b-flashmap-map-offline.yaml) |
 | DFlash (Ascend) | Online disaggregated, external | [`qwen3.5-4b-dflash-online-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/external/qwen3.5-4b-dflash-online-npu.yaml) |
 | MTP (Ascend) | Online disaggregated, managed-local | [`qwen3.5-4b-mtp-disaggregated-npu.yaml`](https://github.com/sgl-project/SpecForge/blob/main/examples/configs/online/disaggregated/managed-local/qwen3.5-4b-mtp-disaggregated-npu.yaml) |
 
@@ -693,9 +693,9 @@ specforge export --to sglang \
 
 `--to sglang` currently implements the EAGLE3 serving-key contract. Use
 `--to hf` for DFlash, DFlash2, Domino, DSpark, FlashMap, and P-EAGLE model
-directories; a FlashMap export is the released FlashMap layout, which
-`python -m specforge.export.flashmap` prepares for SGLang (see
-[FlashMap](../concepts/FlashMap.md)).
+directories. For FlashMap, `--to hf` writes the FlashMap release format, which
+the standalone `flashmap[sglang]` plugin serves in SGLang as it is (see
+[Serving FlashMap](flashmap_sglang.md)).
 For an EAGLE-family self-contained Hugging Face directory, provide the target model as
 the source of the frozen embedding when it is absent from the runtime
 checkpoint:

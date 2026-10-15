@@ -147,7 +147,7 @@ export default defineConfig({
             { text: 'Data Preparation', link: '/basic_usage/data_preparation' },
             { text: 'Training', link: '/basic_usage/training' },
             { text: 'Disaggregated Training', link: '/basic_usage/disaggregated_training' },
-            { text: 'Serving FlashMap with SGLang', link: '/basic_usage/flashmap_sglang' },
+            { text: 'Serving FlashMap', link: '/basic_usage/flashmap_sglang' },
             { text: 'AMD ROCm Tutorial', link: '/basic_usage/AMD/amd_rocm' },
             { text: 'Ascend NPU Tutorial', link: '/basic_usage/Ascend/ascend_npu' },
           ],

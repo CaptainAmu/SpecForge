@@ -380,8 +380,8 @@ class OnlineFlashMapModel(nn.Module):
         target_ids, eval_mask, position_ids = labels
         bsz, num_blocks = anchor_positions.shape
         # Categories and times are drawn for every anchor slot of the padded
-        # batch, bsz * num_anchors, as DeepSpec does: a row with few valid
-        # anchors still gets its share of drafting-jump blocks.
+        # batch, bsz * num_anchors: a row with few valid anchors still gets its
+        # share of drafting-jump blocks.
         kind, s, u, t = (
             draws[:, :num_blocks]
             for draws in self._sample_map_times(
