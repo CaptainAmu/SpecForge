@@ -21,8 +21,6 @@ buffers) are exactly what SGLang's EAGLE3 draft loader reads.
 from __future__ import annotations
 
 import argparse
-import json
-import tempfile
 from typing import Dict, Optional
 
 from specforge.export.checkpoint_io import (
@@ -70,10 +68,6 @@ def export_to_sglang(
     ``vocab_mapping_path`` refreshes the ``t2d``/``d2t`` buffers when the
     checkpoint predates them.
     """
-    if _is_flashmap(checkpoint_path, draft_config_path):
-        return _export_flashmap(
-            checkpoint_path, draft_config_path, output_dir, vocab_mapping_path
-        )
     state = resolve_training_state(checkpoint_path)
     if state.get("strategy") != "eagle3":
         raise ValueError(
@@ -92,47 +86,6 @@ def export_to_sglang(
     model.save_pretrained(output_dir, state_dict=_serving_state(full, weight_map))
     apply_legacy_rope_scaling(output_dir)
     return output_dir
-
-
-def _is_flashmap(checkpoint_path: str, draft_config_path: str) -> bool:
-    from specforge.export.flashmap import ARCHITECTURE, is_flashmap_folder
-
-    if is_flashmap_folder(checkpoint_path):
-        return True
-    try:
-        with open(draft_config_path, encoding="utf-8") as handle:
-            config = json.load(handle)
-    except (OSError, ValueError):
-        return False
-    return (
-        config.get("model_type") == "flashmap"
-        or (config.get("architectures") or [None])[0] == ARCHITECTURE
-    )
-
-
-def _export_flashmap(checkpoint_path, draft_config_path, output_dir, ranking_path):
-    """FlashMap drafts are served by ``specforge.serving.sglang`` from the layout
-    ``specforge.export.flashmap`` writes; a training checkpoint is first
-    materialized in the release layout (canonical names, no target weights).
-    ``ranking_path`` (``--vocab-mapping``) is the draft-vocabulary ranking."""
-    from specforge.export.flashmap import export_flashmap_to_sglang, is_flashmap_folder
-
-    if is_flashmap_folder(checkpoint_path):
-        return export_flashmap_to_sglang(
-            checkpoint_path, output_dir, draft_vocab=ranking_path
-        )
-    model = materialize_draft(
-        resolve_training_state(checkpoint_path), draft_config_path
-    )
-    # Drop only target copies: x_embed, time_embed and jump_embed are trained.
-    state = {
-        k: v
-        for k, v in model.state_dict().items()
-        if k.split(".")[0] not in ("embed_tokens", "lm_head")
-    }
-    with tempfile.TemporaryDirectory() as release:
-        model.save_pretrained(release, state_dict=state)
-        return export_flashmap_to_sglang(release, output_dir, draft_vocab=ranking_path)
 
 
 def main(argv=None) -> int:

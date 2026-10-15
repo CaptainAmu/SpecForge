@@ -90,28 +90,3 @@ factory.
 seams, and
 `tests/test_offline_capture/test_sglang_backend.py`
 provides the GPU smoke coverage for dense and MoE offline capture.
-
-## Serving: FlashMap drafts (`specforge.serving.sglang`)
-
-FlashMap drafts are served by stock `sglang==0.5.20` (not the 0.5.18 training
-pin) through its external-model hook,
-`SGLANG_EXTERNAL_MODEL_PACKAGE=specforge.serving.sglang`; no SGLang source
-file is patched. The package checks the sglang version when SGLang loads it
-(`SUPPORTED_SGLANG`) and stops the server on a mismatch, because SGLang would
-otherwise log the failed import and report an unsupported architecture. It
-depends on these 0.5.20 internals:
-
-| Dependency | Upgrade risk |
-|---|---|
-| DSPARK draft protocol: `write_target_hidden_kv`, `attach_shared_modules`, `compute_base_logits`, `markov_head`, `sample_from_anchor` | the worker may call the draft differently |
-| `fused_kv_norm_rope_write(..., is_neox_style=...)` (context K/V write) | kernel signature or pool layout may change |
-| `DSparkWorkerV2.init_cuda_graphs` and `_maybe_build_draft_sampler` (wrapped once; FlashMap drafts only) | method names and arguments may change |
-| `DsparkDraftSampler` fields (`out`, `corrected_out`, `temperatures`, `greedy_mask`, `_tp_sync`, ...), asserted when taken over | the folded sampler's buffers may change |
-| `VanillaMarkov` (subclassed as an identity head), `SampleStepTokens`, `SpecTpSyncSite` | sampling helpers may move |
-| `sgl_kernel.flash_attn.flash_attn_with_kvcache` / `get_scheduler_metadata` with paged KV | FlashAttention binding may change |
-| Tree drafting only (`FLASHMAP_TREE_N`): `DSparkWorkerV2._forward_decode` (replaced by the tree step), `FlashAttentionBackend.__init__` and `dflash_utils._DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS` (tree masks on the target), `TritonAttnBackend.__init__` (`FLASHMAP_SPLITKV_VERIFY`), `Scheduler._add_request_to_queue` (refuses non-greedy, logprob and constrained requests on arrival), `build_tree_kernel_efficient` / `verify_tree_greedy_func` | worker, backend and scheduler internals may change |
-
-The standalone `flashmap` package (`flashmap[sglang]`, an SGLang plugin) carries
-the same integration and depends on the same internals.
-
-Serving docs: `docs/sections/basic_usage/flashmap_sglang.md`.
