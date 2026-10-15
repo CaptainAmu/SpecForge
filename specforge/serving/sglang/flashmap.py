@@ -101,6 +101,9 @@ from specforge.serving.sglang.flashmap_jump_bank import (  # noqa: E402
 )
 from specforge.serving.sglang.flashmap_kernels import (  # noqa: E402
     block_self_attention,
+    fp8_linear,
+    kv_norm_rope_write_fp8,
+    quantize_weight_fp8,
     rms_norm,
     rms_norm_rope,
 )
@@ -140,7 +143,42 @@ def _(query, key_buffer, value_buffer, cache_seqlens, page_table, scheduler_meta
     return torch.empty_like(query)
 
 
-def _cross_attention_schedule(query_shape, cache_seqlens, page_table):
+@torch.library.custom_op(
+    "specforge_flashmap::paged_cross_attention_fp8", mutates_args=()
+)
+def _paged_cross_attention_fp8(
+    query: torch.Tensor,
+    key_buffer: torch.Tensor,
+    value_buffer: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    page_table: torch.Tensor,
+    scheduler_metadata: torch.Tensor,
+) -> torch.Tensor:
+    """``_paged_cross_attention`` onto an e4m3 pool (written with scale 1): the
+    bf16 query is quantized per (request, head) and every operand descaled."""
+    q_scale = query.float().abs().amax(dim=(1, 3)).clamp_min(1e-12) / 448.0
+    query8 = (query.float() / q_scale[:, None, :, None]).to(key_buffer.dtype)
+    ones = torch.ones_like(q_scale)
+    return flash_attn_with_kvcache(
+        q=query8,
+        k_cache=key_buffer.unsqueeze(1),
+        v_cache=value_buffer.unsqueeze(1),
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        causal=False,
+        scheduler_metadata=scheduler_metadata,
+        q_descale=q_scale,
+        k_descale=ones,
+        v_descale=ones,
+    ).to(query.dtype)
+
+
+@_paged_cross_attention_fp8.register_fake
+def _(query, key_buffer, value_buffer, cache_seqlens, page_table, scheduler_metadata):
+    return torch.empty_like(query)
+
+
+def _cross_attention_schedule(query_shape, cache_seqlens, page_table, dtype):
     """FlashAttention's tile schedule for ``_paged_cross_attention``, computed
     once per draft step for all layers (it depends only on shapes and lengths)."""
     bsz, block_size, heads, head_dim = query_shape
@@ -152,7 +190,7 @@ def _cross_attention_schedule(query_shape, cache_seqlens, page_table):
         num_heads_k=heads,
         headdim=head_dim,
         cache_seqlens=cache_seqlens,
-        qkv_dtype=torch.bfloat16,
+        qkv_dtype=dtype,
         page_size=1,
         causal=False,
     )
@@ -233,8 +271,13 @@ class FlashMapDraftModel(FlashMapDiT):
         # Scales the starting noise; checks set 0 for deterministic drafts.
         self.noise_temperature = 1.0
         self.folded_noise = os.environ.get("FLASHMAP_FOLDED_NOISE", "0") == "1"
+        # FP8 (e4m3) copies of the large weights, per output channel, with the
+        # activations quantized per token on the fly (_quantize_fp8).
+        self.fp8 = os.environ.get("FLASHMAP_FP8", "0") == "1"
+        self._fp8 = {}
         self._constants = None
         self._fused_write = None  # (pool id, kernel arguments)
+        self._kv_fp8 = False  # an e4m3 draft KV pool (set with the pool)
         self._draft = self._draft_impl
         self._anchor_kv = self._anchor_kv_impl
         from sglang.srt.distributed import get_tensor_model_parallel_world_size
@@ -357,6 +400,8 @@ class FlashMapDraftModel(FlashMapDiT):
         self.folded_head = self._fold_lm_head(lm_head_weight, self.hot_ids)
         self.lm_head = _FoldedHead(*self.folded_head, self.vocab_size)
         self.markov_head.hot_ids = self.hot_ids
+        if self.fp8:
+            self._quantize_fp8()
         self._constants = self._jump_constants()
         if self.num_steps > 1:
             self.jump_bank = JumpNoiseBank(
@@ -375,6 +420,40 @@ class FlashMapDraftModel(FlashMapDiT):
             )
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def _quantize_fp8(self) -> None:
+        """FP8 copies of every large GEMM's weight: the DiT's linears, ``x_embed``,
+        the folded head, ``fc`` and the context/anchor projections. Norms, the
+        AdaLN constants and the noise draw (``z @ L^T``, whose input is the noise
+        itself) stay bf16."""
+        if torch.cuda.get_device_capability() < (8, 9):
+            raise RuntimeError("FLASHMAP_FP8=1 needs FP8 tensor cores (Ada/Hopper)")
+        weights = {
+            "x_embed": (self.x_embed.weight, self.x_embed.bias),
+            "fc": (self.fc.weight, None),
+            "ctx_kv": (self._ctx_kv_weight, None),
+            "anchor_proj": (self.anchor_proj.weight, self.anchor_proj.bias),
+            "head": self.folded_head,
+        }
+        for i, layer in enumerate(self.layers):
+            weights[f"qkv{i}"] = (self._self_qkv_weights[i], None)
+            weights[f"self_o{i}"] = (layer.self_attn.o_proj.weight, None)
+            weights[f"cross_q{i}"] = (layer.cross_attn.q_proj.weight, None)
+            weights[f"cross_o{i}"] = (layer.cross_attn.o_proj.weight, None)
+            weights[f"fc1_{i}"] = (layer.mlp.fc1.weight, layer.mlp.fc1.bias)
+            weights[f"fc2_{i}"] = (layer.mlp.fc2.weight, layer.mlp.fc2.bias)
+        for key, (weight, bias) in weights.items():
+            self._fp8[key] = (*quantize_weight_fp8(weight), bias)
+
+    def _linear(self, x, key: str, weight, bias=None) -> torch.Tensor:
+        """``x @ weight^T + bias``, in FP8 with ``FLASHMAP_FP8=1``."""
+        if self.fp8:
+            return fp8_linear(x, *self._fp8[key])
+        return F.linear(x, weight, bias)
+
+    def head_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """The draft-vocabulary logits of the DiT's output (the folded head)."""
+        return self._linear(hidden, "head", *self.folded_head)
 
     def _fold_lm_head(self, lm_head, rows: Optional[torch.Tensor], chunk: int = 8192):
         """The DiT head (dim -> hidden, with bias) and the LM head (hidden ->
@@ -483,8 +562,7 @@ class FlashMapDraftModel(FlashMapDiT):
         pass
 
     def compute_base_logits(self, hidden: torch.Tensor):
-        weight, bias = self.folded_head
-        return F.linear(hidden, weight, bias), None
+        return self.head_logits(hidden), None
 
     @torch.no_grad()
     def write_target_hidden_kv(
@@ -530,14 +608,31 @@ class FlashMapDraftModel(FlashMapDiT):
     def _write_context(self, target_hidden, positions, locs, args, **commit):
         """k-norm, RoPE and the write for every layer in one launch (sglang's
         fused DSpark kernel, which skips uncommitted verify columns)."""
-        meta, k_norm_weights, cos_sin, kv_size = args
         context = rms_norm(
-            self.fc(target_hidden.to(self._ctx_kv_weight.dtype)),
+            self._linear(
+                target_hidden.to(self._ctx_kv_weight.dtype), "fc", self.fc.weight
+            ),
             self._hidden_norm_weight,
             self.rms_norm_eps,
         )
-        fused_kv_norm_rope_write(
-            F.linear(context, self._ctx_kv_weight),
+        self._kv_write(
+            self._linear(context, "ctx_kv", self._ctx_kv_weight),
+            args,
+            positions,
+            locs,
+            **commit,
+        )
+
+    def _kv_write(self, kv, args, positions, locs, **commit) -> None:
+        """Every layer's context keys (k-normed, rotated) and values from the
+        projections ``kv``, written at ``locs``: sglang's fused DSpark kernel for
+        a bf16 pool, ours for an e4m3 one."""
+        meta, k_norm_weights, cos_sin, kv_size = args
+        write = kv_norm_rope_write_fp8 if self._kv_fp8 else fused_kv_norm_rope_write
+        if not self._kv_fp8:
+            commit["is_neox_style"] = False  # FlashMap rotates interleaved pairs
+        write(
+            kv,
             meta,
             k_norm_weights,
             cos_sin,
@@ -547,7 +642,6 @@ class FlashMapDraftModel(FlashMapDiT):
             kv_size,
             self.head_dim,
             self.qk_norm_eps,
-            is_neox_style=False,  # FlashMap rotates interleaved pairs
             **commit,
         )
 
@@ -560,13 +654,17 @@ class FlashMapDraftModel(FlashMapDiT):
             for layer_id in range(self.num_stages)
         ]
         for buf in (buf for pair in buffers for buf in pair):
-            if not buf.is_cuda or buf.dtype != torch.bfloat16:
+            if not buf.is_cuda or buf.dtype not in (
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+            ):
                 raise ValueError(
-                    f"the FlashMap draft KV pool must be bf16 on CUDA, got {buf.dtype} "
-                    "(a quantized --kv-cache-dtype is not supported for the draft)"
+                    f"the FlashMap draft KV pool must be bf16 or fp8_e4m3 on CUDA, got "
+                    f"{buf.dtype} (--speculative-draft-kv-cache-dtype)"
                 )
             assert buf.shape[1:] == (self.num_heads, self.head_dim), buf.shape
             assert buf.stride(1) == self.head_dim and buf.stride(2) == 1
+        self._kv_fp8 = buffers[0][0].dtype == torch.float8_e4m3fn
         device = self._ctx_kv_weight.device
         meta = torch.tensor(
             [
@@ -628,26 +726,21 @@ class FlashMapDraftModel(FlashMapDiT):
         # The anchor's context entry goes into its own slot, the first of the
         # request's verify window, so each request attends to positions
         # 0..anchor; committing the verified tokens later overwrites the slot.
-        meta, k_norm_weights, cos_sin, kv_size = self._fused_write_args(pool)
-        fused_kv_norm_rope_write(
+        self._kv_write(
             self._anchor_kv(input_ids.view(bsz, gamma)[:, 0]),
-            meta,
-            k_norm_weights,
-            cos_sin,
+            self._fused_write_args(pool),
             anchor_positions,
             forward_batch.out_cache_loc.view(bsz, gamma)[:, 0],
-            self.num_stages,
-            kv_size,
-            self.head_dim,
-            self.qk_norm_eps,
-            is_neox_style=False,
         )
         page_table = get_req_to_token_pool().req_to_token[
             forward_batch.req_pool_indices
         ]
         cache_seqlens = (forward_batch.seq_lens + 1).to(torch.int32)
         schedule = _cross_attention_schedule(
-            (bsz, block_size, self.num_heads, self.head_dim), cache_seqlens, page_table
+            (bsz, block_size, self.num_heads, self.head_dim),
+            cache_seqlens,
+            page_table,
+            torch.float8_e4m3fn if self._kv_fp8 else torch.bfloat16,
         )
         hidden = self._draft(
             block_positions,
@@ -666,10 +759,11 @@ class FlashMapDraftModel(FlashMapDiT):
     def _anchor_kv_impl(self, anchor_ids: torch.Tensor) -> torch.Tensor:
         """Every layer's context key/value row for each anchor token, before
         k-norm and RoPE (the fused write applies those)."""
-        anchor = self.anchor_norm(
-            self.anchor_proj(F.embedding(anchor_ids, self.embedding))
+        anchor = F.embedding(anchor_ids, self.embedding)
+        anchor = self._linear(
+            anchor, "anchor_proj", self.anchor_proj.weight, self.anchor_proj.bias
         )
-        return F.linear(anchor, self._ctx_kv_weight)
+        return self._linear(self.anchor_norm(anchor), "ctx_kv", self._ctx_kv_weight)
 
     def _draft_impl(
         self, block_positions, page_table, cache_seqlens, schedule, keys, values
@@ -693,7 +787,9 @@ class FlashMapDraftModel(FlashMapDiT):
             )
             gate = self.noise_gate_at(self.grid[0], self.grid[1])
             embedded = uniform + gate * self.noise_norm(z @ noise)
-            hidden = self.x_embed(embedded)
+            hidden = self._linear(
+                embedded, "x_embed", self.x_embed.weight, self.x_embed.bias
+            )
             return self._denoise(0, hidden, *attend).reshape(slots, -1)
         if self.num_steps == 1:
             # The same, embedded by the folded path (_folded_noise).
@@ -716,15 +812,19 @@ class FlashMapDraftModel(FlashMapDiT):
         bank = self.jump_bank
         rows, seeds = bank.draw(slots, block_positions.device)
         embedded = bank.first_input(self, rows, uniform)
-        weight, bias = self.folded_head
         supports = []
         for step in range(self.num_steps):
             if step:
                 embedded = bank.jump_input(self, step, rows, seeds, supports)
-            hidden = self.x_embed(embedded.view(bsz, block_size, -1))
+            hidden = self._linear(
+                embedded.view(bsz, block_size, -1),
+                "x_embed",
+                self.x_embed.weight,
+                self.x_embed.bias,
+            )
             hidden = self._denoise(step, hidden, *attend).reshape(slots, -1)
             if step + 1 < self.num_steps:
-                logits = F.linear(hidden, weight, bias)
+                logits = self.head_logits(hidden)
                 supports.append(top_predictions(logits, self.jump_topk, self.hot_ids))
         return hidden
 
@@ -743,33 +843,42 @@ class FlashMapDraftModel(FlashMapDiT):
             m_scale, m_shift, m_gate = mlp
             # Self-attention within each request's block.
             normed = F.layer_norm(hidden, (self.dim,), eps=eps) * s_scale + s_shift
-            qkv = F.linear(normed, self._self_qkv_weights[i])
+            qkv = self._linear(normed, f"qkv{i}", self._self_qkv_weights[i])
             attended = block_self_attention(
                 qkv.view(bsz, block_size, 3, self.num_heads, self.head_dim),
                 *self._self_norm_weights[i],
                 freqs,
                 self.qk_norm_eps,
             )
-            hidden = hidden + s_gate * layer.self_attn.o_proj(
-                attended.reshape(bsz, block_size, self.dim)
+            attended = attended.reshape(bsz, block_size, self.dim)
+            hidden = hidden + s_gate * self._linear(
+                attended, f"self_o{i}", layer.self_attn.o_proj.weight
             )
             # Cross-attention onto the paged context.
             normed = F.layer_norm(hidden, (self.dim,), eps=eps) * c_scale + c_shift
             attn = layer.cross_attn
             query = rms_norm_rope(
-                attn.q_proj(normed).view(shape),
+                self._linear(normed, f"cross_q{i}", attn.q_proj.weight).view(shape),
                 self._cross_q_norm_weights[i],
                 freqs,
                 self.qk_norm_eps,
             )
-            context = _paged_cross_attention(
+            cross_attention = (
+                _paged_cross_attention_fp8 if self._kv_fp8 else _paged_cross_attention
+            )
+            context = cross_attention(
                 query, keys[i], values[i], cache_seqlens, page_table, schedule
             )
-            hidden = hidden + c_gate * attn.o_proj(
-                context.reshape(bsz, block_size, self.dim)
+            context = context.reshape(bsz, block_size, self.dim)
+            hidden = hidden + c_gate * self._linear(
+                context, f"cross_o{i}", attn.o_proj.weight
             )
             normed = F.layer_norm(hidden, (self.dim,), eps=eps) * m_scale + m_shift
-            hidden = hidden + m_gate * layer.mlp(normed)
+            mlp = layer.mlp
+            normed = self._linear(normed, f"fc1_{i}", mlp.fc1.weight, mlp.fc1.bias)
+            normed = F.gelu(normed)
+            normed = self._linear(normed, f"fc2_{i}", mlp.fc2.weight, mlp.fc2.bias)
+            hidden = hidden + m_gate * normed
         return F.layer_norm(hidden, (self.dim,), eps=eps) * final_scale + final_shift
 
 

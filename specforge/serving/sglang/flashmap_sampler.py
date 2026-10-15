@@ -152,10 +152,9 @@ class FlashMapDraftSampler(DsparkDraftSampler):
         del input_ids
         bs = hidden_states.shape[0] // self.query_token_num
         rows = bs * self.gamma
-        weight, bias = self.model.folded_head
         hot_ids = self.model.hot_ids
         if not self.folded_sampling:
-            logits = torch.addmm(bias, hidden_states, weight.t())
+            logits = self.model.head_logits(hidden_states)
             tokens = self._tp_sync.sync(
                 SpecTpSyncSite.DSPARK_GRAPH_GREEDY, logits.argmax(dim=-1)
             )
@@ -164,16 +163,15 @@ class FlashMapDraftSampler(DsparkDraftSampler):
             greedy = self.greedy_mask[:bs].repeat_interleave(self.gamma)
             if self.fused:
                 out = self.hot_logits if hot_ids is not None else self.corrected_out
-                logits = torch.addmm(bias, hidden_states, weight.t(), out=out[:rows])
+                logits = out[:rows]
+                logits.copy_(self.model.head_logits(hidden_states))
                 self.seed.add_(1)
                 tokens = sample_rows(logits, temperatures, greedy, self.seed)
             else:
+                logits = self.model.head_logits(hidden_states)
                 if hot_ids is None:
-                    logits = torch.addmm(
-                        bias, hidden_states, weight.t(), out=self.corrected_out[:rows]
-                    )
+                    self.corrected_out[:rows].copy_(logits)
                 else:
-                    logits = torch.addmm(bias, hidden_states, weight.t())
                     self.corrected_out[:rows].index_copy_(1, hot_ids, logits)
                 tokens = SampleStepTokens.execute(
                     step_logits=logits,

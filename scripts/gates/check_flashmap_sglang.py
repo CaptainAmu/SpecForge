@@ -36,15 +36,13 @@ DEVICE = torch.device("cuda")
 class FakePool:
     """The slice of sglang's MHA KV pool the draft uses."""
 
-    def __init__(self, *, layers, slots, heads, head_dim):
+    def __init__(self, *, layers, slots, heads, head_dim, dtype=torch.bfloat16):
         shape = (slots, heads, head_dim)
         self.keys = [
-            torch.zeros(shape, dtype=torch.bfloat16, device=DEVICE)
-            for _ in range(layers)
+            torch.zeros(shape, dtype=dtype, device=DEVICE) for _ in range(layers)
         ]
         self.values = [
-            torch.zeros(shape, dtype=torch.bfloat16, device=DEVICE)
-            for _ in range(layers)
+            torch.zeros(shape, dtype=dtype, device=DEVICE) for _ in range(layers)
         ]
 
     def get_key_buffer(self, layer_id):
@@ -116,6 +114,12 @@ def main():
     parser.add_argument("--draft", required=True, help="sglang export directory")
     parser.add_argument("--target", required=True, help="target model path or hub id")
     parser.add_argument("--context-lens", default="150,220")
+    parser.add_argument(
+        "--kv-dtype",
+        choices=("bf16", "fp8"),
+        default="bf16",
+        help="draft KV pool dtype (fp8: e4m3, as --speculative-draft-kv-cache-dtype)",
+    )
     args = parser.parse_args()
     from sglang.srt.model_executor.forward_context import (
         ForwardContext,
@@ -163,6 +167,7 @@ def main():
             slots=4096,
             heads=draft.num_heads,
             head_dim=draft.head_dim,
+            dtype=torch.float8_e4m3fn if args.kv_dtype == "fp8" else torch.bfloat16,
         )
         slots = 1 + torch.randperm(4095, device=DEVICE)  # slot 0 is sglang's dummy slot
         req_to_token = slots[: len(lens) * 1024].view(len(lens), 1024).to(torch.int32)
@@ -196,7 +201,7 @@ def main():
                 commit_lens=torch.tensor([commit], device=DEVICE),
             )
             assert all(
-                not pool.keys[i][locs[length : split + width]].any()
+                not pool.keys[i][locs[length : split + width]].float().any()
                 for i in range(draft.num_stages)
             ), "uncommitted verify columns were written"
 
@@ -270,9 +275,14 @@ def main():
                 f"{int(decisive.sum())} decisive slots"
             )
             # A gross-error bound: bf16 rounding through six DiT layers and the
-            # folded head reaches ~8% of the largest logit on random context.
-            assert diff < 1e-1, diff
-            assert agree[decisive].all(), "a decisive slot drafted another token"
+            # folded head reaches ~8% of the largest logit on random context,
+            # FP8 weights or an e4m3 KV pool ~15% (their acceptance is measured
+            # end to end).
+            lossy = draft.fp8 or args.kv_dtype == "fp8"
+            assert diff < (2.5e-1 if lossy else 1e-1), diff
+            assert (
+                lossy or agree[decisive].all()
+            ), "a decisive slot drafted another token"
         assert math.isfinite(served.float().sum().item())
     print("ok")
 

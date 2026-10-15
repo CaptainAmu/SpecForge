@@ -136,3 +136,105 @@ class TestSampleRows(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
+    "needs FP8 tensor cores",
+)
+class TestFp8Linear(unittest.TestCase):
+    def test_close_to_bf16_linear(self):
+        from specforge.serving.sglang.flashmap_kernels import (
+            fp8_linear,
+            quantize_weight_fp8,
+        )
+
+        torch.manual_seed(0)
+        x = torch.randn(48, 2048, device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn(6144, 2048, device="cuda", dtype=torch.bfloat16) * 0.02
+        bias = torch.randn(6144, device="cuda", dtype=torch.bfloat16)
+        reference = F.linear(x, weight, bias).float()
+        got = fp8_linear(x, *quantize_weight_fp8(weight), bias).float()
+        error = (got - reference).norm() / reference.norm()
+        self.assertLess(error.item(), 0.05)
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "needs CUDA")
+class TestFp8KvWrite(unittest.TestCase):
+    def test_matches_sglang_bf16_write(self):
+        try:
+            from sglang.kernels.ops.speculative.dspark.fused_kv_write import (
+                fused_kv_norm_rope_write,
+            )
+        except Exception:
+            self.skipTest("needs sglang 0.5.20")
+        from specforge.serving.sglang.flashmap_kernels import kv_norm_rope_write_fp8
+
+        torch.manual_seed(0)
+        layers, heads, dim, slots, rows = 2, 4, 128, 64, 10
+        kv = torch.randn(rows, layers * 2 * heads * dim, device="cuda").to(
+            torch.bfloat16
+        )
+        norm = torch.rand(layers, dim, device="cuda") + 0.5
+        angles = torch.randn(256, dim // 2, device="cuda")
+        cos_sin = torch.cat([angles.cos(), angles.sin()], dim=-1).contiguous()
+        positions = torch.randint(0, 256, (rows,), device="cuda")
+        locs = torch.randperm(slots - 1, device="cuda")[:rows] + 1
+        pools = {}
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+            buffers = [
+                torch.zeros(slots, heads, dim, device="cuda").to(dtype)
+                for _ in range(2 * layers)
+            ]
+            meta = torch.tensor(
+                [
+                    [
+                        buffers[2 * i].data_ptr(),
+                        buffers[2 * i + 1].data_ptr(),
+                        heads * dim,
+                        heads * dim,
+                    ]
+                    for i in range(layers)
+                ],
+                dtype=torch.int64,
+                device="cuda",
+            )
+            write = (
+                kv_norm_rope_write_fp8
+                if dtype == torch.float8_e4m3fn
+                else lambda *a, **k: fused_kv_norm_rope_write(
+                    *a, is_neox_style=False, **k
+                )
+            )
+            write(
+                kv, meta, norm, cos_sin, positions, locs, layers, heads * dim, dim, 1e-5
+            )
+            pools[dtype] = buffers
+        for bf16, fp8 in zip(pools[torch.bfloat16], pools[torch.float8_e4m3fn]):
+            torch.testing.assert_close(
+                fp8[locs].float(), bf16[locs].float(), rtol=0.07, atol=0.02
+            )
+
+
+class TestBuildTree(unittest.TestCase):
+    def test_trie_of_candidates(self):
+        from specforge.serving.sglang.flashmap_tree import build_tree_abi
+
+        # Two requests, three candidates of four drafts each; width 6 keeps 5 nodes.
+        candidates = torch.tensor(
+            [
+                [[1, 2, 3, 4], [1, 2, 5, 6], [7, 8, 9, 10]],
+                [[1, 1, 1, 1], [1, 1, 1, 1], [1, 1, 1, 1]],
+            ]
+        )
+        width = 6
+        tokens, ids, stats = build_tree_abi(candidates, width)
+        self.assertEqual(stats.tolist(), [[10, 3], [4, 1]])
+        # Request 0: the shared prefix [1, 2] (votes 2) first, then the rest by
+        # depth: 1, 7 at depth 0; 2, 8 at depth 1; 3 at depth 2.
+        self.assertEqual(tokens[0].tolist(), [1, 7, 2, 8, 3])
+        parents = (ids // width).tolist()
+        self.assertEqual(parents[0], [0, 0, 1, 2, 3])
+        # Request 1: one chain of four nodes, padded with a copy of the first.
+        self.assertEqual(tokens[1].tolist(), [1, 1, 1, 1, 1])
+        self.assertEqual(parents[1], [0, 1, 2, 3, 0])

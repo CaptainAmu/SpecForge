@@ -248,3 +248,113 @@ def sample_rows(
 
 
 __all__ += ["sample_rows"]
+
+
+# The largest e4m3 magnitude.
+_FP8_MAX = 448.0
+
+
+def quantize_weight_fp8(weight: torch.Tensor):
+    """``weight (N, K)`` -> ``(e4m3 weight (N, K), float32 scale (1, N))``, one
+    scale per output channel."""
+    scale = weight.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / _FP8_MAX
+    quantized = (weight.float() / scale).to(torch.float8_e4m3fn)
+    return quantized, scale.t().contiguous()
+
+
+def fp8_linear(x, weight, scale, bias=None) -> torch.Tensor:
+    """``x @ W^T + b`` with ``W`` from :func:`quantize_weight_fp8` and ``x``
+    quantized per row on the fly (dynamic per-token scales): one FP8 GEMM with
+    row-wise scales (Hopper), bf16 out. Elementwise parts fuse under compile."""
+    rows = x.reshape(-1, x.shape[-1])
+    x_scale = rows.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / _FP8_MAX
+    quantized = (rows.float() / x_scale).to(torch.float8_e4m3fn)
+    out = torch._scaled_mm(
+        quantized, weight.t(), scale_a=x_scale, scale_b=scale, out_dtype=torch.bfloat16
+    )
+    if bias is not None:
+        out = out + bias
+    return out.view(*x.shape[:-1], -1)
+
+
+__all__ += ["fp8_linear", "quantize_weight_fp8"]
+
+
+@triton.jit
+def _kv_norm_rope_write_fp8_kernel(
+    kv_ptr,
+    meta_ptr,
+    knw_ptr,
+    cos_sin_ptr,
+    pos_ptr,
+    loc_ptr,
+    commit_lens_ptr,
+    locs_row_width,
+    k_scale,
+    v_scale,
+    KV: tl.constexpr,
+    D: tl.constexpr,
+    NH: tl.constexpr,
+    L: tl.constexpr,
+    EPS: tl.constexpr,
+    HAS_COMMIT_LENS: tl.constexpr,
+):
+    # sglang's fused_kv_norm_rope_write (interleaved RoPE), storing e4m3 with
+    # static per-tensor scales instead of bf16.
+    t = tl.program_id(0).to(tl.int64)
+    layer = tl.program_id(1).to(tl.int64)
+    if HAS_COMMIT_LENS:
+        row_b = t // locs_row_width
+        if t - row_b * locs_row_width >= tl.load(commit_lens_ptr + row_b).to(tl.int64):
+            return
+    loc = tl.load(loc_ptr + t).to(tl.int64)
+    if loc < 0:
+        return
+    pos = tl.load(pos_ptr + t).to(tl.int64)
+    HALF: tl.constexpr = D // 2
+    half = tl.arange(0, HALF)
+    d = tl.arange(0, D)
+    even, odd = 2 * half, 2 * half + 1
+    cos = tl.load(cos_sin_ptr + pos * D + half).to(tl.float32)
+    sin = tl.load(cos_sin_ptr + pos * D + HALF + half).to(tl.float32)
+    w_even = tl.load(knw_ptr + layer * D + even).to(tl.float32)
+    w_odd = tl.load(knw_ptr + layer * D + odd).to(tl.float32)
+    k_buf = tl.load(meta_ptr + layer * 4 + 0).to(tl.pointer_type(tl.float8e4nv))
+    v_buf = tl.load(meta_ptr + layer * 4 + 1).to(tl.pointer_type(tl.float8e4nv))
+    k_stride = tl.load(meta_ptr + layer * 4 + 2)
+    v_stride = tl.load(meta_ptr + layer * 4 + 3)
+    row = kv_ptr + t * (L * 2 * KV) + layer * (2 * KV)
+    for h in tl.static_range(NH):
+        k = tl.load(row + h * D + d).to(tl.float32)
+        inv = 1.0 / tl.sqrt(tl.sum(k * k, 0) / D + EPS)
+        k1 = (tl.load(row + h * D + even).to(tl.float32) * inv * w_even).to(tl.bfloat16)
+        k2 = (tl.load(row + h * D + odd).to(tl.float32) * inv * w_odd).to(tl.bfloat16)
+        k1, k2 = k1.to(tl.float32), k2.to(tl.float32)
+        o1 = (k1 * cos - k2 * sin) / k_scale
+        o2 = (k2 * cos + k1 * sin) / k_scale
+        tl.store(k_buf + loc * k_stride + h * D + even, o1.to(tl.float8e4nv))
+        tl.store(k_buf + loc * k_stride + h * D + odd, o2.to(tl.float8e4nv))
+        v = tl.load(row + KV + h * D + d).to(tl.float32) / v_scale
+        tl.store(v_buf + loc * v_stride + h * D + d, v.to(tl.float8e4nv))
+
+
+def kv_norm_rope_write_fp8(
+    kv, meta, k_norm_weights, cos_sin, positions, locs, num_layers, kv_size,
+    head_dim, eps, *, k_scale=1.0, v_scale=1.0, commit_lens=None, locs_row_width=None,
+):  # fmt: skip
+    """``fused_kv_norm_rope_write`` (same arguments; interleaved RoPE) for an
+    e4m3 pool: keys k-normed and rotated, both divided by their static scale."""
+    if kv.shape[0] == 0:
+        return
+    has_commit = commit_lens is not None
+    _kv_norm_rope_write_fp8_kernel[(kv.shape[0], num_layers)](
+        kv, meta, k_norm_weights, cos_sin,
+        positions.to(torch.int64).contiguous(), locs.to(torch.int64).contiguous(),
+        commit_lens.contiguous() if has_commit else locs, locs_row_width or 1,
+        k_scale, v_scale,
+        KV=kv_size, D=head_dim, NH=kv_size // head_dim, L=num_layers, EPS=eps,
+        HAS_COMMIT_LENS=has_commit,
+    )  # fmt: skip
+
+
+__all__ += ["kv_norm_rope_write_fp8"]
