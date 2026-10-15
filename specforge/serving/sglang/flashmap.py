@@ -32,7 +32,7 @@ DSPARK drives a block draft through a small protocol, implemented here:
     uniform whatever the noise: its embedding is a constant, and the noise
     enters only through ``x @ E ~ N(0, E^T E)``, drawn as ``z @ L^T`` with
     ``L L^T = E^T E`` (Cholesky), so no vocabulary-sized noise is ever formed.
-    ``FLASHMAP_FOLDED_NOISE=1`` (opt-in, not yet benchmarked) draws it from the
+    ``FLASHMAP_FOLDED_NOISE=1`` (opt-in, measured on Qwen3-8B only) draws it from the
     eigendecomposition instead, which folds the noise's RMSNorm and ``x_embed``
     into one GEMM (``_folded_noise``);
   - more jumps (``FLASHMAP_NUM_STEPS``) take their vocabulary-sized inputs from
@@ -53,8 +53,8 @@ export's ``num_steps``), ``FLASHMAP_DRAFT_VOCAB`` (0: the full vocabulary,
 ``FLASHMAP_JUMP_TOPK`` (bank draws, 8192; support per jump, 16),
 ``FLASHMAP_COMPILE`` (0 disables torch.compile), ``FLASHMAP_COMPILE_MODE``
 (``max-autotune-no-cudagraphs``; modes that capture their own CUDA graphs
-would nest inside sglang's), and two opt-in variants not yet benchmarked in a
-server: ``FLASHMAP_FOLDED_NOISE=1`` (above) and ``FLASHMAP_FUSED_SAMPLER=1``
+would nest inside sglang's), and two opt-in variants measured on Qwen3-8B
+only: ``FLASHMAP_FOLDED_NOISE=1`` (above) and ``FLASHMAP_FUSED_SAMPLER=1``
 (:mod:`.flashmap_sampler`).
 
 Supported: sglang 0.5.20 (``SUPPORTED_SGLANG``), tensor parallelism 1, a bf16
