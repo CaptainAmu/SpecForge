@@ -190,8 +190,12 @@ def _forward_decode_tree(self, batch, on_publish):
         or batch.return_logprob
         or not (sampling_info is None or sampling_info.is_all_greedy)
     ):
+        # Falling back to DSPARK's chain step is not safe: tried with greedy
+        # logprob requests, it broke their outputs on a tree-mode server
+        # (whether through the tree-mode verify setup or DSPARK's logprob path
+        # is not yet known), so such requests are refused.
         raise NotImplementedError(
-            "FlashMap tree verify (FLASHMAP_TREE_N) supports greedy requests "
+            "FlashMap tree verify (FLASHMAP_TREE_N) serves greedy requests "
             "(temperature 0) without grammar or logprobs only"
         )
     state = _tree_state(self)

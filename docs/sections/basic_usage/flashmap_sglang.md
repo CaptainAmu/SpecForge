@@ -87,6 +87,33 @@ faster everywhere measured from concurrency 4 up (see Results); the map still
 drafts its whole block, as it was trained, and only the first drafts are
 verified.
 
+### Tree drafting (opt-in)
+
+`FLASHMAP_TREE_N=<N>` drafts up to N candidate blocks per request from
+independent noise in one draft pass (their queries side by side in the
+cross-attention, so the context is read once), merges them into a trie inside
+the draft graph and keeps the 16 nodes the most candidates share; the target
+verifies that tree (17 tokens with the root, DSPARK's own width) and the commit
+reorders the verify window's `req_to_token` entries instead of moving KV. A batch
+of `bs` requests drafts `clamp(FLASHMAP_TREE_BUDGET // bs, 1, N)` candidates each
+(budget 32). `FLASHMAP_SPLITKV_VERIFY=1` with `--attention-backend triton` runs the
+target's verify attention with a split-KV Triton kernel that applies the tree
+mask only to each request's 17 x 17 block; it is what makes the tree pay.
+
+```bash
+SGLANG_EXTERNAL_MODEL_PACKAGE=specforge.serving.sglang SGLANG_DSPARK_FOLDED_PROPOSAL=0 \
+FLASHMAP_TREE_N=8 FLASHMAP_SPLITKV_VERIFY=1 \
+python -m sglang.launch_server --model-path Qwen/Qwen3-8B --attention-backend triton --page-size 1 \
+  --speculative-algorithm DSPARK --speculative-draft-model-path FlashMap-Qwen3-8B-sglang \
+  --speculative-dspark-block-size 16
+```
+
+Constraints: greedy requests only, without grammar or logprobs: anything else
+raises in the scheduler (stopping the server), so serve only greedy traffic with
+it; `--page-size 1`, `SGLANG_DSPARK_FOLDED_PROPOSAL=0`, a target attention backend
+that reads a tree mask (triton, flashinfer or fa3), one jump, the full verify
+width. Use it at low concurrency (see Results).
+
 Greedy (temperature 0) requests are lossless: every committed token is the
 target's own greedy choice. Sampling requests are verified by DSPARK's
 rejection sampling against the draft's logits.
@@ -273,6 +300,30 @@ halves (7.1 to 3.6 GB at 311k tokens on Qwen3-8B, memory sglang can give to the
 target's KV), but throughput is unchanged at these lengths (prompt plus output
 up to ~2k tokens): the draft step's context reads are not yet the bottleneck.
 
+**Tree drafting** (Qwen3-8B, 1 jump, greedy; acceptance / tok/s; one run each, the split-KV tree twice)
+
+| | gsm8k c1 | humaneval c1 | mt-bench c1 | gsm8k c4 | gsm8k c16 |
+|---|---|---|---|---|---|
+| chain, FA3 target (default) | 7.72 / 656 | 5.71 / 486 | 2.32 / 200 (main table) | 7.83 / 2159 | 7.91 / 5703 |
+| chain, Triton target + split-KV verify | 8.20 / 679 | 5.61 / 472 | 2.36 / 201 | 7.97 / 2212 | 7.86 / 5237 |
+| tree N=4, FA3 target | 8.56 / 667 | 6.25 / 490 | - | 8.64 / 2191 | 8.32 / 5082 |
+| tree N=8, Triton + split-KV | 8.46-8.66 / 695-711 | 6.13-6.26 / 503-516 | 2.62 / 220 | 8.75-8.85 / 2306-2313 | 8.19 / 5431-5638 |
+| tree N=8, Triton + split-KV, FP8 weights | 8.56 / 698 | 6.21 / 510 | - | - | - |
+
+The tree with the split-KV verify is 4-10% faster than the default FA3 chain at
+concurrency 1 and 7% at 4 (its acceptance is 8-13% higher at the same verify
+width); at 16 the budget leaves 2 candidates per request and the Triton target
+is slower than FA3, so it loses 1-5%: use the FA3 chain there. On FA3 the tree
+barely pays (its tree-mask verify costs about what the extra acceptance gains).
+FP8 draft weights compose with it, without gain. Teacher-forced checks of the
+tree servers' greedy outputs: every token the target's argmax or within 0.5
+logit, except one humaneval token at 0.75 with the split-KV verify (of ~12k;
+the split-KV kernel rounds attention differently from the target's own kernel).
+Qwen3-4B, concurrency 1: the split-KV tree reaches 1009 / 760 tok/s on gsm8k /
+humaneval against 946 / 722 for the FA3 chain (+7% / +5%), with every greedy
+token the target's argmax or within 0.5 logit; at concurrency 4 it ties
+(3195 vs 3229).
+
 **Losslessness.** Speculative verification runs the target on 17-token windows,
 decoding alone on one token, and their bf16 kernels round differently, so a
 near-tied argmax can flip and greedy texts part ways with the target-only
@@ -285,9 +336,9 @@ are the target-only server's own outputs.
 
 **Gaps.** Not measured: verify widths below 16 at concurrency 1, the opt-in
 variants on Qwen3-4B, temperature 1 on Qwen3-4B, and the e4m3 draft KV pool at
-long contexts (where its reads would matter). Tree drafting (several candidate
-blocks verified as a tree, DeepSpec's best concurrency-1 configuration) is not
-ported yet.
+long contexts (where its reads would matter), tree drafting on Qwen3-4B, wider
+trees for small batches (DeepSpec's `TREE_WIDTHS`, not ported) and trees with
+banked multi-jump drafts.
 
 ## SGLang internals touched
 
