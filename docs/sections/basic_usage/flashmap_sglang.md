@@ -26,9 +26,10 @@ SGLang's external model package hook, so no SGLang source change is needed.
   pip install --no-deps -e /path/to/SpecForge   # or PYTHONPATH=/path/to/SpecForge
   ```
 
-- Tensor parallelism 1 (the draft is not sharded), a bf16 draft KV pool (no
-  quantized `--kv-cache-dtype`), a target without vocabulary padding or muP
-  logit scaling. Each is checked at startup.
+- Tensor parallelism 1 (the draft is not sharded), a bf16 or e4m3 draft KV pool
+  (`--speculative-draft-kv-cache-dtype fp8_e4m3`, independent of the target's
+  KV dtype; other quantized KV dtypes are rejected), a target without
+  vocabulary padding or muP logit scaling. Each is checked at startup.
 
 ## 1. Export
 
@@ -71,6 +72,7 @@ Environment knobs, read when the server starts:
 | `FLASHMAP_JUMP_BANK` / `FLASHMAP_JUMP_TOPK` | 8192 / 16 | multi-jump noise bank size / tokens kept per intermediate prediction |
 | `FLASHMAP_COMPILE` / `FLASHMAP_COMPILE_MODE` | 1 / default | torch.compile of the draft step; only modes without their own CUDA graphs (`default`, `max-autotune-no-cudagraphs`), since sglang captures the step |
 | `FLASHMAP_FOLDED_NOISE` | 0 | opt-in (lossless, measured on Qwen3-8B only): draw one jump's noise from the eigendecomposition of `E^T E`, folding its RMSNorm and `x_embed` into one GEMM (saves a 4096x4096 GEMM per step on Qwen3-8B) |
+| `FLASHMAP_FP8` | 0 | opt-in (Ada/Hopper): e4m3 copies of the draft's large GEMM weights (DiT, `x_embed`, folded head, `fc`, context and anchor projections), per output channel, with activations quantized per token; acceptance unchanged, 5% off the draft step at batch 1-4, no measurable end-to-end gain (see Results) |
 | `FLASHMAP_FUSED_SAMPLER` | 0 | opt-in (lossless, measured on Qwen3-8B only): one sampling kernel (argmax for greedy rows, Gumbel-max with in-kernel Philox otherwise), no noise buffer, full-vocabulary logits scattered only for sampling batches |
 
 `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1` (an sglang option) overlaps DSPARK's
@@ -244,6 +246,33 @@ draft step at batch 1); they stay opt-in until measured on more settings.
 | FlashMap, 2 jumps | 8.11 / 7269 (3.54x) | 6.05 / 4759 (2.86x) | 3.75 / 3420 (2.03x) |
 | DeepSpec, 1 jump | 7.59 / 7926 (3.86x) | 5.73 / 5349 (3.21x) | 3.61 / 3804 (2.26x) |
 
+**FP8 draft weights** (`FLASHMAP_FP8=1`, Qwen3-8B, 1 jump, greedy; one run each)
+
+| | gsm8k c1 | humaneval c1 | mt-bench c1 | gsm8k c16 | mt-bench c16 | draft step bs 1 / 4 / 16 |
+|---|---|---|---|---|---|---|
+| bf16 | 7.96 / 672 | 5.70 / 483 | 2.32 / 200 | 7.81 / 5569 | 3.54 / 2380 | 1030 / 1155 / 1670 us |
+| FP8 | 7.71 / 649 | 5.70 / 484 | 2.32 / 201 | 7.79 / 5660 | 3.51 / 2335 | 978 / 1113 / 1687 us |
+
+Acceptance is unchanged within run-to-run noise, but the draft step only gets
+5% faster at small batches (the per-token activation quantization and FP8 GEMMs
+at 16 rows per request do not reach the halved weight traffic's bound), about
+0.4% of a decode step, below the noise of end-to-end throughput; FP8 weights
+stay opt-in.
+
+**FP8 draft KV pool** (`--speculative-draft-kv-cache-dtype fp8_e4m3`, Qwen3-8B, 1 jump, greedy; one run each)
+
+| | gsm8k c1 | humaneval c1 | gsm8k c16 | mt-bench c16 | arena-hard-v2 c16 |
+|---|---|---|---|---|---|
+| bf16 draft KV | 7.73 / 659 | 5.67 / 481 | 7.72 / 5774 | 3.52 / 2362 | 3.07 / 2285 |
+| e4m3 draft KV | 7.71 / 647 | 5.73 / 481 | 7.81 / 5667 | 3.55 / 2379 | 3.06 / 2278 |
+
+The cross-attention context is written e4m3 (scale 1; keys k-normed and
+rotated, by a Triton port of the fused write) and read by FA3 with the query
+quantized per request and head. Acceptance is unchanged and the draft pool
+halves (7.1 to 3.6 GB at 311k tokens on Qwen3-8B, memory sglang can give to the
+target's KV), but throughput is unchanged at these lengths (prompt plus output
+up to ~2k tokens): the draft step's context reads are not yet the bottleneck.
+
 **Losslessness.** Speculative verification runs the target on 17-token windows,
 decoding alone on one token, and their bf16 kernels round differently, so a
 near-tied argmax can flip and greedy texts part ways with the target-only
@@ -255,7 +284,10 @@ server) is the target's argmax or within 0.5 logit of it (a bf16 near-tie), as
 are the target-only server's own outputs.
 
 **Gaps.** Not measured: verify widths below 16 at concurrency 1, the opt-in
-variants on Qwen3-4B, and temperature 1 on Qwen3-4B.
+variants on Qwen3-4B, temperature 1 on Qwen3-4B, and the e4m3 draft KV pool at
+long contexts (where its reads would matter). Tree drafting (several candidate
+blocks verified as a tree, DeepSpec's best concurrency-1 configuration) is not
+ported yet.
 
 ## SGLang internals touched
 
