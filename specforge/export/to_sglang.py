@@ -124,8 +124,12 @@ def _export_flashmap(checkpoint_path, draft_config_path, output_dir, ranking_pat
     model = materialize_draft(
         resolve_training_state(checkpoint_path), draft_config_path
     )
-    state = {k: v for k, v in model.state_dict().items() if "embed" not in k.lower()}
-    state.pop("lm_head.weight", None)
+    # Drop only target copies: x_embed, time_embed and jump_embed are trained.
+    state = {
+        k: v
+        for k, v in model.state_dict().items()
+        if k.split(".")[0] not in ("embed_tokens", "lm_head")
+    }
     with tempfile.TemporaryDirectory() as release:
         model.save_pretrained(release, state_dict=state)
         return export_flashmap_to_sglang(release, output_dir, draft_vocab=ranking_path)
