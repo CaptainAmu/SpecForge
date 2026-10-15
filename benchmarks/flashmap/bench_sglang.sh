@@ -6,7 +6,8 @@
 #
 # One server at a time; each is started, checked to run its method, warmed up,
 # then timed on every cell, then stopped. Servers are listed in SERVERS as
-# name=method[:draft dir][:env assignments separated by +]:
+# name=method[:draft dir][:env assignments separated by +][:extra server
+# arguments separated by +]:
 #
 #   target                    the target alone
 #   flashmap:<export>         FlashMap via DSPARK (python -m specforge.export.flashmap);
@@ -46,8 +47,8 @@ REPO=${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}
 mkdir -p "${OUT}"
 log() { echo "[$(date '+%F %T')] $*"; }
 
-server_cmd() {  # method draft -> the launch command for that method
-    local method=$1 draft=$2
+server_cmd() {  # method draft [extra server args, '+'-separated]
+    local method=$1 draft=$2 extra=${3:-}
     local cmd=(python -m sglang.launch_server --model-path "${TARGET}" --host 127.0.0.1
                --port "${PORT}" --dtype bfloat16 --mem-fraction-static "${MEM_FRACTION}"
                --max-running-requests "${MAX_RUNNING}" --cuda-graph-max-bs-decode "${MAX_RUNNING}")
@@ -62,15 +63,16 @@ server_cmd() {  # method draft -> the launch command for that method
             cmd+=(--speculative-algorithm DFLASH --speculative-draft-model-path "${draft}") ;;
         *) echo "unknown method ${method}" >&2; return 1 ;;
     esac
+    [[ -n ${extra} ]] && cmd+=(${extra//+/ })
     echo "${cmd[@]}"
 }
 
-run_server() {  # name=method[:draft][:env]
+run_server() {  # name=method[:draft][:env][:extra server args]
     local name=${1%%=*} spec=${1#*=}
-    local method draft environment
-    IFS=: read -r method draft environment <<<"${spec}"
+    local method draft environment extra
+    IFS=: read -r method draft environment extra <<<"${spec}"
     local cmd
-    cmd=$(server_cmd "${method}" "${draft}") || return 1
+    cmd=$(server_cmd "${method}" "${draft}" "${extra}") || return 1
     log "${name}: ${cmd}"
     (
         export PYTHONPATH=${REPO}${PYTHONPATH:+:${PYTHONPATH}}
