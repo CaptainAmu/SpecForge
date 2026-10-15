@@ -20,9 +20,9 @@ python -m sglang.launch_server --model-path Qwen/Qwen3-8B \
 It needs `sglang==0.5.20` exactly and tensor parallelism 1. The block size
 comes from the draft's `config.json`, and sampling at `temperature > 0` needs
 no extra option. The package's
-[Serving with SGLang](https://github.com/al-jshen/flashmap#serve-with-sglang)
-section covers the options (two-jump drafting, FP8 weights and draft KV cache,
-tree drafting) and its `flashmap[vllm]` extra serves the same folders in vLLM.
+[Serve with SGLang](https://github.com/al-jshen/flashmap#serve-with-sglang)
+section has the commands, and its `flashmap[vllm]` extra serves the same folders
+in vLLM.
 
 ## Serving a SpecForge-trained draft
 
