@@ -92,6 +92,9 @@ torchrun --nproc_per_node=8 scripts/prepare_hidden_states.py \
     --output-path ./cache/hidden_states/qwen3-8b-flashmap-perfectblend \
     --chat-template qwen --max-length 4096
 
+# (sglang builds JIT kernels during capture: CUDA_HOME must name a CUDA
+#  toolkit with nvcc, and ninja must be on PATH)
+
 # stage 1: the flow
 specforge train --config examples/configs/offline/colocated/qwen3-8b-flashmap-flow-offline.yaml
 
@@ -141,6 +144,12 @@ specforge export --to hf \
 
 python -m specforge.export.flashmap \
     --src ./exports/FlashMap-Qwen3-8B --output-dir ./exports/FlashMap-Qwen3-8B-sglang
+
+# or both steps at once, from the training checkpoint
+specforge export --to sglang \
+    --checkpoint ./outputs/qwen3-8b-flashmap-map-offline \
+    --draft-config configs/qwen3-8b-flashmap.json \
+    --output-dir ./exports/FlashMap-Qwen3-8B-sglang
 ```
 
 Then serve the second directory as described in
