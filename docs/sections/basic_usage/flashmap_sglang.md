@@ -10,7 +10,7 @@ SGLang version for training:
 
 ```bash
 uv venv --python 3.12 .venv-sglang && source .venv-sglang/bin/activate
-uv pip install "sglang==0.5.20" "flashmap[sglang] @ git+https://github.com/al-jshen/flashmap"
+uv pip install "sglang==0.5.20" "flashmap[sglang]"
 
 python -m sglang.launch_server --model-path Qwen/Qwen3-8B \
   --speculative-algorithm DSPARK \
