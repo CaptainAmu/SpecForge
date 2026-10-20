@@ -1,11 +1,13 @@
 # FlashMap
 
-FlashMap is a block-parallel drafter. Like DFlash it drafts the 16 tokens
-after the last verified token (the anchor) in one pass, conditioned on the
-target's hidden states. Its block comes from a distilled discrete flow map
-(Flow Map Language Models, arXiv:2602.16813): one network evaluation jumps
-Gaussian noise over the target vocabulary straight to per-slot token
-distributions. Two jumps cost twice as much and are more accurate.
+FlashMap ([paper](https://arxiv.org/abs/2610.24365), [project
+page](https://jshen.net/flashmap)) is a block-parallel drafter. Like DFlash it
+drafts the 16 tokens after the last verified token (the anchor) in one pass,
+conditioned on the target's hidden states. Its block comes from a distilled
+discrete flow map (Flow Map Language Models, arXiv:2602.16813): one network
+evaluation jumps Gaussian noise over the target vocabulary straight to
+per-slot token distributions. Two jumps cost twice as much and are more
+accurate.
 
 | Boundary | FlashMap value |
 | --- | --- |
@@ -156,3 +158,17 @@ whether a checkpoint holds a flow or a map, so the map's draft config serves
 for both, and a flow's `config.json` records `"flow_map": false`. An exported
 directory loads back into SpecForge (`model.draft_checkpoint_path` or
 `model.flashmap_flow_checkpoint`) as it is.
+
+## Citation
+
+```bibtex
+@misc{flashmap2026,
+  title         = {{FlashMap}: Flow Map Speculative Decoding},
+  author        = {Shen, Jeff and Zhou, Zhejian and Lee, Ryan and May, Jonathan and Ho, Shirley},
+  year          = {2026},
+  eprint        = {2610.24365},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CL},
+  url           = {https://arxiv.org/abs/2610.24365}
+}
+```
