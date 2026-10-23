@@ -130,16 +130,37 @@ class BF16Optimizer:
         """With ``decay_matrices_only``, biases, norm gains and embedding tables
         are not decayed: only parameters that are at least 2-D in the model as
         built (see :func:`record_parameter_shapes`) are. Without decay there is
-        one group, the layout every earlier checkpoint was saved with."""
+        one group, the layout every earlier checkpoint was saved with.
+
+        Parameters tagged ``_specforge_lr`` (and optionally
+        ``_specforge_weight_decay``) form extra groups with their own learning
+        rate and decay, appended after the groups above; the schedulers scale
+        every group's base learning rate alike."""
+        tagged = {}
+        params = []
+        for param, master in zip(self.model_params, self.fp32_params):
+            if hasattr(param, "_specforge_lr"):
+                key = (
+                    float(param._specforge_lr),
+                    float(getattr(param, "_specforge_weight_decay", 0.0)),
+                )
+                tagged.setdefault(key, []).append(master)
+            else:
+                params.append((param, master))
+        extra = [
+            {"params": masters, "lr": lr, "weight_decay": decay}
+            for (lr, decay), masters in tagged.items()
+        ]
         if weight_decay == 0 or not decay_matrices_only:
-            return self.fp32_params
+            masters = [master for _, master in params]
+            return [{"params": masters}, *extra] if extra else masters
         embeddings = {
             id(module.weight)
             for module in self.model.modules()
             if isinstance(module, torch.nn.Embedding)
         }
         decay, no_decay = [], []
-        for param, master in zip(self.model_params, self.fp32_params):
+        for param, master in params:
             if not _is_matrix(param) or id(param) in embeddings:
                 no_decay.append(master)
             else:
@@ -147,6 +168,7 @@ class BF16Optimizer:
         return [
             {"params": decay},
             {"params": no_decay, "weight_decay": 0.0},
+            *extra,
         ]
 
     def configure_grad_norm_reduction(

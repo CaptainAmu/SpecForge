@@ -982,6 +982,16 @@ class TrainingConfig(StrictConfigModel):
     flashmap_diagonal_fraction: float = Field(default=0.5, ge=0.0, le=1.0)
     flashmap_boundary_prob: float = Field(default=0.0625, ge=0.0, le=1.0)
     flashmap_antithetic_sampling: bool = True
+    #: FlashPlaid trains its latent-diffusion teacher (Plaid's NELBO) first.
+    flashplaid_stage: Literal["teacher"] = "teacher"
+    #: Learning rate of FlashPlaid's latent embedding table and noise schedule
+    #: (Plaid: 1e-2), scheduled like the main learning rate.
+    flashplaid_aux_lr: float = Field(default=1e-2, gt=0.0)
+    #: Plaid's batch split between reconstruction (t = 0) and diffusion blocks:
+    #: adapted to the ratio of the two terms' standard deviations, starting from
+    #: (or, when not adaptive, fixed at) this reconstruction share.
+    flashplaid_adaptive_recon: bool = True
+    flashplaid_recon_fraction: float = Field(default=0.125, gt=0.0, lt=1.0)
     #: P-EAGLE COD sampling/model knobs.
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8

@@ -58,6 +58,12 @@ class BuiltinProviderParityTest(unittest.TestCase):
                 {"sdpa", "flex_attention"},
                 None,
             ),
+            "flashplaid": (
+                "FlashPlaidDraftModel",
+                {"input_ids", "loss_mask", "hidden_states"},
+                {"sdpa", "flex_attention"},
+                None,
+            ),
             "peagle": (
                 "PEagleDraftModel",
                 {
@@ -163,6 +169,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
             "domino": "DominoTrainStrategy",
             "dspark": "DSparkTrainStrategy",
             "flashmap": "FlashMapTrainStrategy",
+            "flashplaid": "FlashPlaidTrainStrategy",
         }
         model = object()
         for name, class_name in expected.items():
@@ -182,7 +189,7 @@ class BuiltinProviderParityTest(unittest.TestCase):
             "loss_mask": torch.tensor([[1, 1, 1, 1, 1]]),
             "hidden_states": torch.ones(1, 5, 4),
         }
-        for name in ("dflash", "domino", "flashmap"):
+        for name in ("dflash", "domino", "flashmap", "flashplaid"):
             with self.subTest(algorithm=name):
                 collate = (
                     self.registry.resolve(name)

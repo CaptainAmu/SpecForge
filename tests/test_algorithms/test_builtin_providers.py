@@ -24,7 +24,16 @@ from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
 from specforge.algorithms.registry import AlgorithmRegistration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILTINS = ("dflash", "domino", "dspark", "eagle3", "flashmap", "mtp", "peagle")
+BUILTINS = (
+    "dflash",
+    "domino",
+    "dspark",
+    "eagle3",
+    "flashmap",
+    "flashplaid",
+    "mtp",
+    "peagle",
+)
 
 
 def _teacher_metrics_config(enabled: bool):
@@ -145,6 +154,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
             "peagle": ("llama", 4, 32000, False),
             "dflash": ("qwen3", 1, None, True),
             "flashmap": ("flashmap", 6, None, True),
+            "flashplaid": ("flashplaid", 6, None, False),
         }
         for name, (model_type, layers, vocab_size, has_override) in expected.items():
             with self.subTest(algorithm=name):
@@ -229,6 +239,15 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 boundary_prob=0.0625,
                 antithetic_sampling=True,
             ),
+            "flashplaid": SimpleNamespace(
+                stage="teacher",
+                block_size=16,
+                latent_dim=16,
+                attention_backend="flex_attention",
+                num_anchors=512,
+                loss_decay_gamma=7.0,
+                adaptive_recon=True,
+            ),
             "mtp": SimpleNamespace(),
         }
         expected_keys = {
@@ -276,6 +295,14 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "flashmap_diagonal_fraction",
                 "flashmap_boundary_prob",
                 "flashmap_antithetic_sampling",
+            },
+            "flashplaid": {
+                "flashplaid_stage",
+                "flashplaid_block_size",
+                "flashplaid_latent_dim",
+                "flashplaid_num_anchors",
+                "flashplaid_loss_decay_gamma",
+                "flashplaid_adaptive_recon",
             },
             "mtp": {
                 "mtp_draft_num_hidden_layers",
@@ -494,7 +521,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
     def test_other_builtins_always_request_their_registered_layout(self):
         # Planning rejects the opt-out for these algorithms; resolution keeps
         # their registered layouts regardless (DSpark trains on last_hidden).
-        for name in ("domino", "dspark", "eagle3", "flashmap", "mtp", "peagle"):
+        for name in ("domino", "dspark", "eagle3", "flashmap", "flashplaid", "mtp", "peagle"):
             registration = self.registry.resolve(name)
             provider = registration.providers.server_streaming_for("text")
             with self.subTest(algorithm=name):
@@ -593,7 +620,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         code = (
             "import sys; "
             "from specforge.algorithms.builtin import builtin_algorithm_registry; "
-            "r=builtin_algorithm_registry(); assert len(r)==7; "
+            "r=builtin_algorithm_registry(); assert len(r)==8; "
             "assert 'torch' not in sys.modules; "
             "assert 'specforge.training.strategies.registry' not in sys.modules"
         )

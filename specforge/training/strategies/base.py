@@ -641,6 +641,17 @@ class FlashMapTrainStrategy(DFlashTrainStrategy):
     name = "flashmap"
 
 
+class FlashPlaidTrainStrategy(DFlashTrainStrategy):
+    """FlashPlaid (latent-diffusion teacher) on DFlash's features and step.
+
+    ``OnlineFlashPlaidModel`` takes DFlash's forward arguments and returns
+    token-pooled ``loss_terms``; its embedding table and noise schedule are
+    draft weights, so they are optimized and checkpointed with the DiT.
+    """
+
+    name = "flashplaid"
+
+
 class MTPTrainStrategy(DraftTrainStrategy):
     """MTP strategy over ``OnlineMTPModel`` with final-hidden supervision."""
 

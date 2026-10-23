@@ -1,0 +1,49 @@
+# FlashPlaid stage 1: the latent-diffusion teacher (Plaid's NELBO in a learned
+# 16-d token space), on DFlash/FlashMap's offline features; prepare them with
+#   scripts/prepare_hidden_states.py --strategy flashmap \
+#     --draft-model-config configs/qwen3-4b-flashmap.json ...
+# (the same target layers [1, 9, 17, 25, 33], so FlashMap feature dirs work as they are).
+model:
+  target_model_path: Qwen/Qwen3-4B
+  draft_model_config: configs/qwen3-4b-flashplaid.json
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: ./cache/hidden_states/qwen3-4b-flashmap-perfectblend
+  max_length: 4096
+  chat_template: qwen
+  cache_dir: ./cache
+
+training:
+  strategy: flashplaid
+  flashplaid_stage: teacher
+  flashplaid_aux_lr: 1.0e-2
+  flashplaid_adaptive_recon: true
+  num_epochs: 20
+  batch_size: 1
+  accumulation_steps: 32
+  learning_rate: 3.0e-4
+  warmup_ratio: 0.04
+  adam_beta2: 0.95
+  weight_decay: 0.1
+  fsdp_sharding: NO_SHARD
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 512
+  objective_chunk_blocks: 64
+  loss_decay_gamma: 7.0
+  save_interval: 2000
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+
+run_id: qwen3-4b-flashplaid-teacher-offline
+output_dir: ./outputs/qwen3-4b-flashplaid-teacher-offline
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

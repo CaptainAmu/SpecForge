@@ -9,6 +9,7 @@ from .dflash2 import DFlash2DraftModel
 from .domino import DominoDraftModel
 from .dspark import DSparkDraftModel
 from .flashmap import FlashMapDraftModel
+from .flashplaid import FlashPlaidDraftModel
 from .llama3_eagle import LlamaForCausalLMEagle3
 from .mtp import Qwen3_5MTPDraftModel
 from .peagle import PEagleDraftModel
@@ -21,6 +22,7 @@ __all__ = [
     "DominoDraftModel",
     "DSparkDraftModel",
     "FlashMapDraftModel",
+    "FlashPlaidDraftModel",
     "LlamaForCausalLMEagle3",
     "PEagleDraftModel",
     "Qwen3_5MTPDraftModel",
