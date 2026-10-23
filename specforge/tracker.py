@@ -352,9 +352,34 @@ class MLflowTracker(Tracker):
             self.is_initialized = False
 
 
+class WandbTensorboardTracker(Tracker):
+    """Weights & Biases for viewing runs online, plus TensorBoard event files
+    in the output directory for local analysis; every record goes to both."""
+
+    @classmethod
+    def validate_args(cls, parser, args):
+        WandbTracker.validate_args(parser, args)
+        TensorboardTracker.validate_args(parser, args)
+
+    def __init__(self, args, output_dir: str):
+        super().__init__(args, output_dir)
+        self.trackers = [WandbTracker(args, output_dir), TensorboardTracker(args, output_dir)]
+        self.is_initialized = any(tracker.is_initialized for tracker in self.trackers)
+
+    def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):
+        for tracker in self.trackers:
+            tracker.log(log_dict, step=step)
+
+    def close(self):
+        for tracker in self.trackers:
+            tracker.close()
+        self.is_initialized = False
+
+
 # --- Tracker Factory ---
 TRACKER_REGISTRY = {
     "wandb": WandbTracker,
+    "wandb+tensorboard": WandbTensorboardTracker,
     "swanlab": SwanlabTracker,
     "tensorboard": TensorboardTracker,
     "mlflow": MLflowTracker,
