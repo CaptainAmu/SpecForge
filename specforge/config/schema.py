@@ -989,6 +989,9 @@ class TrainingConfig(StrictConfigModel):
     #: Learning rate of FlashPlaid's latent embedding table and noise schedule
     #: (Plaid: 1e-2), scheduled like the main learning rate.
     flashplaid_aux_lr: float = Field(default=1e-2, gt=0.0)
+    #: Learn the schedule endpoints gamma_0 / gamma_1 (Plaid). False keeps them at
+    #: the draft config's gamma_{0,1}_init; the interior shape stays learned.
+    flashplaid_learn_endpoints: bool = True
     #: Plaid's batch split between reconstruction (t = 0) and diffusion blocks:
     #: adapted to the ratio of the two terms' standard deviations, starting from
     #: (or, when not adaptive, fixed at) this reconstruction share.

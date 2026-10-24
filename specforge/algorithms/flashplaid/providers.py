@@ -180,6 +180,14 @@ def build_training_model(config, draft_model, draft_config, target_config, token
         # A fresh run (a resume restores the trained table over this).
         initialize_latent_from_target(draft_model, target_parts.embed_tokens.weight)
         logger.info("FlashPlaid: latent table initialized from the target embedding PCA")
+    if not training.flashplaid_learn_endpoints:
+        schedule = draft_model.noise_schedule
+        schedule.gamma_0.requires_grad_(False)
+        schedule.gamma_1.requires_grad_(False)
+        logger.info(
+            "FlashPlaid: schedule endpoints frozen at gamma_0=%.3f, gamma_1=%.3f",
+            float(schedule.gamma_0), float(schedule.gamma_1),
+        )
     tag_aux_parameters(draft_model, training.flashplaid_aux_lr)
     _decorrelate_ranks(int(training.seed))
     return AlgorithmModelParts(model=model, capture_layers=list(draft_model.target_layer_ids))
