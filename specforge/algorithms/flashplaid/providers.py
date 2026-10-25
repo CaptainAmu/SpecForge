@@ -111,7 +111,9 @@ def initialize_latent_from_target(draft_model, target_embedding) -> None:
     """Start the latent table as the target embedding's top principal
     subspace: ``E`` centred, projected on the leading ``latent_dim``
     eigenvectors of its covariance, rows normalized. Deterministic (float64
-    ``eigh`` on the CPU), so every rank computes the same table."""
+    ``eigh`` on the CPU), so every rank computes the same table. A
+    ``target_projection`` table starts with ``P`` = that basis, i.e. the same
+    table."""
     import torch
 
     with torch.no_grad():
@@ -120,6 +122,10 @@ def initialize_latent_from_target(draft_model, target_embedding) -> None:
         covariance = (centered.T @ centered).double().cpu()
         _, eigenvectors = torch.linalg.eigh(covariance)
         basis = eigenvectors[:, -draft_model.latent_dim :].flip(-1)
+        if draft_model.config.latent_param == "target_projection":
+            weight = draft_model.latent_proj.weight
+            weight.copy_(basis.to(device=weight.device, dtype=weight.dtype))
+            return
         projected = centered @ basis.to(device=weight.device, dtype=torch.float32)
         projected = projected / (projected.norm(dim=-1, keepdim=True) + 1e-8)
         draft_model.latent_embed.weight.copy_(projected.to(draft_model.latent_embed.weight))
@@ -176,6 +182,7 @@ def build_training_model(config, draft_model, draft_config, target_config, token
         recon_fraction=training.flashplaid_recon_fraction,
     ).to(device=_device(), dtype=_torch_dtype(config))
     draft_model.restore_fp32_modules()
+    draft_model.set_target_embedding(target_parts.embed_tokens.weight)
     if not config.model.draft_checkpoint_path:
         # A fresh run (a resume restores the trained table over this).
         initialize_latent_from_target(draft_model, target_parts.embed_tokens.weight)

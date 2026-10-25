@@ -212,6 +212,29 @@ class FlashPlaidModelTest(unittest.TestCase):
         initialize_latent_from_target(draft, target)
         torch.testing.assert_close(first, draft.latent_embed.weight.detach())
 
+    def test_target_projection_table_starts_as_the_pca_table_and_trains(self):
+        torch.manual_seed(0)
+        target = torch.randn(VOCAB, TARGET_HIDDEN) @ torch.diag(torch.linspace(3, 0.1, TARGET_HIDDEN))
+        table = FlashPlaidDraftModel(tiny_config())
+        initialize_latent_from_target(table, target)
+        draft = FlashPlaidDraftModel(tiny_config(latent_param="target_projection"))
+        self.assertFalse(hasattr(draft, "latent_embed"))
+        self.assertEqual(("latent_proj", "noise_schedule"), draft._fp32_modules)
+        with self.assertRaises(RuntimeError):
+            draft.latent_weight()
+        draft.set_target_embedding(target)
+        initialize_latent_from_target(draft, target)
+        torch.testing.assert_close(draft.latent_weight(), table.latent_weight(), atol=1e-5, rtol=0)
+        self.assertNotIn("latent_proj.target_embedding", draft.state_dict())
+        randomize(draft)
+        model = wrapper(draft)
+        loss, _, metrics = model(*batch())
+        self.assertTrue(torch.isfinite(loss))
+        metrics["loss_terms"][0].backward()
+        missing = [n for n, p in draft.named_parameters() if p.grad is None]
+        self.assertEqual([], missing)
+        self.assertGreater(float(draft.latent_proj.weight.grad.abs().sum()), 0.0)
+
     def test_aux_parameters_get_their_own_optimizer_groups(self):
         draft = FlashPlaidDraftModel(tiny_config())
         tag_aux_parameters(draft, 1e-2)

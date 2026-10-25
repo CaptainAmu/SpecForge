@@ -41,6 +41,9 @@ from .flashmap import (
 from .registry import register_draft
 
 
+LATENT_PARAMS = ("table", "target_projection")
+
+
 class FlashPlaidConfig(PretrainedConfig):
     r"""Configuration of a FlashPlaid draft model.
 
@@ -49,7 +52,10 @@ class FlashPlaidConfig(PretrainedConfig):
     embedding (for the anchor) and lm_head (for the logits) the draft borrows.
     ``gamma_0_init`` / ``gamma_1_init`` start the learned noise-schedule
     endpoints (Plaid's defaults), ``schedule_hidden`` is the width of its
-    monotone interior network.
+    monotone interior network. ``latent_param`` chooses the latent table:
+    ``"table"`` learns every row freely (Plaid); ``"target_projection"`` learns
+    ``E_h = rownorm((E - mean E) P)`` with ``P (target_hidden_size,
+    latent_dim)``, a projection of the frozen target embedding ``E``.
     """
 
     model_type = "flashplaid"
@@ -71,6 +77,7 @@ class FlashPlaidConfig(PretrainedConfig):
         gamma_1_init: float = 6.0,
         schedule_hidden: int = 1024,
         posterior_input: bool = True,
+        latent_param: str = "table",
         rope_theta: float = 10000.0,
         rms_norm_eps: float = 1e-6,
         qk_norm_eps: float = 1e-5,
@@ -83,6 +90,8 @@ class FlashPlaidConfig(PretrainedConfig):
                 f"hidden_size {hidden_size} must be divisible by "
                 f"num_attention_heads {num_attention_heads}"
             )
+        if latent_param not in LATENT_PARAMS:
+            raise ValueError(f"latent_param must be one of {LATENT_PARAMS}, got {latent_param!r}")
         if not gamma_0_init < gamma_1_init:
             raise ValueError("gamma_0_init must be smaller than gamma_1_init")
         self.target_model = target_model
@@ -100,6 +109,7 @@ class FlashPlaidConfig(PretrainedConfig):
         self.gamma_1_init = float(gamma_1_init)
         self.schedule_hidden = int(schedule_hidden)
         self.posterior_input = bool(posterior_input)
+        self.latent_param = str(latent_param)
         self.rope_theta = float(rope_theta)
         self.rms_norm_eps = float(rms_norm_eps)
         self.qk_norm_eps = float(qk_norm_eps)
@@ -143,6 +153,31 @@ class PlaidNoiseSchedule(nn.Module):
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         gamma_0, gamma_1 = self.bounds()
         return gamma_0 + (gamma_1 - gamma_0) * self.gamma_tilde(t)
+
+
+class TargetLatentProjection(nn.Module):
+    """The latent table as a learned projection of the frozen target embedding,
+    ``(E - mean E) P`` (rows not yet normalized). ``E`` is attached with
+    :meth:`set_target_embedding` as a plain attribute: it is neither trained,
+    checkpointed nor synced across ranks, and it stays where it was attached."""
+
+    def __init__(self, target_hidden: int, latent_dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(target_hidden, latent_dim))
+        self.target_embedding = None
+        self.target_mean = None
+
+    @torch.no_grad()
+    def set_target_embedding(self, embedding: torch.Tensor) -> None:
+        self.target_embedding = embedding.detach().float()
+        self.target_mean = self.target_embedding.mean(dim=0)
+
+    def forward(self) -> torch.Tensor:
+        if self.target_embedding is None:
+            raise RuntimeError("call set_target_embedding(E) before using the latent table")
+        weight = self.weight.float()
+        # (E - mean) P without materializing the centred (V, H) copy.
+        return self.target_embedding @ weight - self.target_mean @ weight
 
 
 class GammaEmbedding(nn.Module):
@@ -194,6 +229,9 @@ class FlashPlaidPreTrainedModel(PreTrainedModel):
             init.normal_(module.weight, mean=0.0, std=1.0)
         elif isinstance(module, FlashMapRMSNorm):
             init.ones_(module.weight)
+        elif isinstance(module, TargetLatentProjection):
+            # Training starts from the target embedding's PCA basis instead.
+            init.normal_(module.weight, mean=0.0, std=module.weight.shape[0] ** -0.5)
         elif isinstance(module, PlaidNoiseSchedule):
             for parameter in (module.W1, module.b1, module.W2):
                 init.normal_(parameter, mean=0.0, std=1.0)
@@ -210,8 +248,6 @@ class FlashPlaidDraftModel(FlashPlaidPreTrainedModel):
     the target lm_head and :meth:`output_prior_logits`.
     """
 
-    # Kept in float32 when the draft is cast to bf16 (see restore_fp32_modules).
-    _fp32_modules = ("latent_embed", "noise_schedule")
 
     def __init__(self, config: FlashPlaidConfig) -> None:
         super().__init__(config)
@@ -228,9 +264,16 @@ class FlashPlaidDraftModel(FlashPlaidPreTrainedModel):
         self.anchor_proj = nn.Linear(target_hidden, dim)
         self.anchor_norm = FlashMapRMSNorm(dim, config.rms_norm_eps)
 
-        # The diffusion space: a learned table of unit-norm token embeddings
-        # and the schedule that noises them.
-        self.latent_embed = nn.Embedding(config.vocab_size, config.latent_dim)
+        # The diffusion space: unit-norm token embeddings (a free table, or a
+        # projection of the target embedding) and the schedule that noises them.
+        if config.latent_param == "table":
+            self.latent_embed = nn.Embedding(config.vocab_size, config.latent_dim)
+            latent_module = "latent_embed"
+        else:
+            self.latent_proj = TargetLatentProjection(target_hidden, config.latent_dim)
+            latent_module = "latent_proj"
+        # Kept in float32 when the draft is cast to bf16 (see restore_fp32_modules).
+        self._fp32_modules = (latent_module, "noise_schedule")
         self.noise_schedule = PlaidNoiseSchedule(
             config.schedule_hidden, config.gamma_0_init, config.gamma_1_init
         )
@@ -273,8 +316,17 @@ class FlashPlaidDraftModel(FlashPlaidPreTrainedModel):
 
     def latent_weight(self) -> torch.Tensor:
         """The embedding table with unit-norm rows, ``(V, latent_dim)`` float32."""
-        weight = self.latent_embed.weight.float()
+        if self.config.latent_param == "table":
+            weight = self.latent_embed.weight.float()
+        else:
+            weight = self.latent_proj()
         return weight / (weight.norm(dim=-1, keepdim=True) + 1e-8)
+
+    def set_target_embedding(self, embedding: torch.Tensor) -> None:
+        """Attach the frozen target embedding a ``target_projection`` latent
+        table is computed from (a no-op for a free table)."""
+        if self.config.latent_param == "target_projection":
+            self.latent_proj.set_target_embedding(embedding)
 
     def freqs(self, position_ids: torch.Tensor) -> torch.Tensor:
         return rope_freqs(position_ids, self.head_dim, self.config.rope_theta)
