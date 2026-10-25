@@ -546,6 +546,10 @@ class DFlashTrainStrategy(DraftTrainStrategy):
             metrics["accuracy_denom"] = model_metrics["accuracy_denom"]
         if "selector_loss_alpha" in model_metrics:
             metrics["selector_loss_alpha"] = model_metrics["selector_loss_alpha"]
+        # Per-position counts for the evaluator's simulated acceptance length.
+        for key in ("acc_corrects", "acc_denoms"):
+            if key in model_metrics:
+                metrics[key] = model_metrics[key]
         return StepOutput(
             loss=loss,
             metrics=metrics,

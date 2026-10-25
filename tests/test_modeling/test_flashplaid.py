@@ -235,6 +235,56 @@ class FlashPlaidModelTest(unittest.TestCase):
         self.assertEqual([], missing)
         self.assertGreater(float(draft.latent_proj.weight.grad.abs().sum()), 0.0)
 
+    def test_focused_times_are_importance_weighted_to_uniform(self):
+        model = wrapper(FlashPlaidDraftModel(tiny_config()), t_focus_start=0.8, t_focus_mass=0.6)
+        torch.manual_seed(0)
+        recon, times, importance, _ = model._split_and_times((4, 500), torch.device("cpu"))
+        diffusion = ~recon
+        t, w = times[diffusion], importance[diffusion]
+        self.assertTrue(torch.all(importance[recon] == 1))
+        self.assertAlmostEqual(float((t >= 0.8).double().mean()), 0.6, places=2)
+        # E_q[1 / q] = 1 and E_q[f / q] = E_U[f]: the estimate stays unbiased.
+        self.assertAlmostEqual(float(w.mean()), 1.0, places=2)
+        self.assertAlmostEqual(float((w * t).mean()), 0.5, places=2)
+
+    def test_t1_cross_entropy_joins_the_training_loss(self):
+        draft = randomize(FlashPlaidDraftModel(tiny_config()))
+        losses = []
+        for weight in (0.0, 0.5):
+            model = wrapper(draft, t1_ce_weight=weight)
+            torch.manual_seed(7)
+            loss, _, metrics = model(*batch())
+            losses.append(float(loss))
+        self.assertIn("flashplaid/ce_t1", metrics["ratio_metrics"])
+        ce, den = metrics["ratio_metrics"]["flashplaid/ce_t1"]
+        self.assertAlmostEqual(losses[1], losses[0] + 0.5 * float(ce / den), places=3)
+        draft.zero_grad()
+        metrics["loss_terms"][0].backward()
+        self.assertEqual([], [n for n, p in draft.named_parameters() if p.grad is None])
+
+    def test_evaluation_reports_conditional_per_position_accuracy(self):
+        draft = randomize(FlashPlaidDraftModel(tiny_config()))
+        model = wrapper(draft).eval()
+        with torch.no_grad():
+            _, _, metrics = model(*batch())
+        corrects = torch.stack(metrics["acc_corrects"])
+        denoms = torch.stack(metrics["acc_denoms"])
+        self.assertEqual((4,), tuple(corrects.shape))
+        self.assertTrue(torch.all(corrects <= denoms))
+        # Slot k + 1 is only counted after slot k was correct.
+        self.assertTrue(torch.all(denoms[1:] <= corrects[:-1] + 1e-9))
+        model.train()
+        _, _, metrics = model(*batch())
+        self.assertNotIn("acc_corrects", metrics)
+
+    def test_plaid_split_tracks_raw_sub_batch_means(self):
+        draft = randomize(FlashPlaidDraftModel(tiny_config()))
+        model = wrapper(draft, split_std="plaid")
+        for _ in range(3):
+            model(*batch())
+        self.assertEqual(3, len(model._moments[0]))
+        self.assertTrue(0.0 < model._current_recon_fraction() < 1.0)
+
     def test_aux_parameters_get_their_own_optimizer_groups(self):
         draft = FlashPlaidDraftModel(tiny_config())
         tag_aux_parameters(draft, 1e-2)

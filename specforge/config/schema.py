@@ -997,6 +997,21 @@ class TrainingConfig(StrictConfigModel):
     #: (or, when not adaptive, fixed at) this reconstruction share.
     flashplaid_adaptive_recon: bool = True
     flashplaid_recon_fraction: float = Field(default=0.125, gt=0.0, lt=1.0)
+    #: Weight of an extra cross-entropy at the drafting state (z ~ N(0, I) at
+    #: gamma_1), added to the training loss (0: pure NELBO).
+    flashplaid_t1_ce_weight: float = Field(default=0.0, ge=0.0)
+    #: Biased diffusion-time draw: a share ``mass`` of the diffusion rows in
+    #: ``[start, 1]``, importance-weighted so the NELBO stays unbiased (both
+    #: unset: uniform t).
+    flashplaid_t_focus_start: Optional[float] = Field(default=None, gt=0.0, lt=1.0)
+    flashplaid_t_focus_mass: Optional[float] = Field(default=None, gt=0.0, lt=1.0)
+    #: Standard deviations behind the adaptive split: "plaid" = of the raw
+    #: sub-batch mean losses (Plaid's code), "scaled" = of the per-block
+    #: importance-scaled estimates (FlashPlaid P1-P1c).
+    flashplaid_split_std: Literal["scaled", "plaid"] = "scaled"
+    #: In evaluation, draft every block in one step from N(0, I) and report the
+    #: per-position conditional accuracies behind eval/simulated_acc_len.
+    flashplaid_simulate_acceptance: bool = True
     #: P-EAGLE COD sampling/model knobs.
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8

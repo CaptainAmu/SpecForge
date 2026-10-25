@@ -17,6 +17,18 @@ ratio of the two terms' standard deviations. Every slot's share is weighted by
 DFlash's slot decay ``w_k`` and pooled over tokens (``loss_terms``); the
 unweighted NELBO is reported in bits per token. The schedule's endpoints
 minimize the loss and its interior the loss variance (Plaid's gradient hook).
+
+Options (all off by default): ``t1_ce_weight`` adds a cross-entropy at the
+drafting state (``z ~ N(0, I)`` at ``gamma_1``) to the training loss;
+``t_focus_start`` / ``t_focus_mass`` draw the diffusion times with density
+biased to ``[t_focus_start, 1]`` and importance-weight them, so the NELBO
+estimate stays unbiased; ``split_std="plaid"`` adapts the reconstruction share
+from the standard deviations of the raw sub-batch mean losses, as Plaid's code
+(``"scaled"``: of the per-block importance-scaled estimates). In evaluation the
+wrapper also drafts every block in one step from ``N(0, I)`` and reports
+per-position conditional accuracies (``acc_corrects`` / ``acc_denoms``), from
+which the evaluator's ``simulated_acc_len`` is the expected number of
+accepted draft tokens.
 """
 
 from __future__ import annotations
@@ -25,6 +37,7 @@ import math
 from typing import Dict, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -38,6 +51,7 @@ from specforge.modeling.draft.flashmap import create_context_mask
 from specforge.modeling.draft.flashplaid import FlashPlaidDraftModel, alpha_sigma
 
 STAGES = ("teacher",)
+SPLIT_STD = ("scaled", "plaid")
 NUM_TIME_BINS = 4
 LN2 = math.log(2.0)
 
@@ -92,6 +106,11 @@ class OnlineFlashPlaidModel(nn.Module):
         adaptive_recon: bool = True,
         recon_fraction: float = 0.125,
         std_ema: float = 0.997,
+        t1_ce_weight: float = 0.0,
+        t_focus_start: Optional[float] = None,
+        t_focus_mass: Optional[float] = None,
+        split_std: str = "scaled",
+        simulate_acceptance: bool = True,
     ):
         super().__init__()
         if stage not in STAGES:
@@ -102,6 +121,16 @@ class OnlineFlashPlaidModel(nn.Module):
             raise ValueError("recon_fraction must be in (0, 1)")
         if objective_chunk_blocks < 0:
             raise ValueError("objective_chunk_blocks must be >= 0")
+        if t1_ce_weight < 0:
+            raise ValueError("t1_ce_weight must be >= 0")
+        if (t_focus_start is None) != (t_focus_mass is None):
+            raise ValueError("t_focus_start and t_focus_mass go together")
+        if t_focus_start is not None and not (
+            0.0 < t_focus_start < 1.0 and 0.0 < t_focus_mass < 1.0
+        ):
+            raise ValueError("t_focus_start and t_focus_mass must be in (0, 1)")
+        if split_std not in SPLIT_STD:
+            raise ValueError(f"split_std must be one of {SPLIT_STD}, got {split_std!r}")
         self.draft_model = draft_model
         self.lm_head = target_lm_head
         self.embed_tokens = target_embed_tokens
@@ -115,6 +144,10 @@ class OnlineFlashPlaidModel(nn.Module):
         self.adaptive_recon = bool(adaptive_recon)
         self.recon_fraction = float(recon_fraction)
         self.std_ema = float(std_ema)
+        self.t1_ce_weight = float(t1_ce_weight)
+        self.t_focus = None if t_focus_start is None else (float(t_focus_start), float(t_focus_mass))
+        self.split_std = split_std
+        self.simulate_acceptance = bool(simulate_acceptance)
         # Running first/second moments of the per-block reconstruction and
         # diffusion estimates (Plaid's adaptive batch split); rank-local and
         # not checkpointed: a resume restarts them from recon_fraction.
@@ -165,11 +198,28 @@ class OnlineFlashPlaidModel(nn.Module):
         return recon_std / (1e-8 + recon_std + diffusion_std)
 
     def _update_moments(self, recon_values, diffusion_values) -> None:
+        """``"scaled"``: running moments of the per-block values. ``"plaid"``:
+        running moments of each sub-batch's mean (Plaid's ``reconst_ema`` /
+        ``diffusion_ema``), averaged over ranks."""
         if not (self.training and self.adaptive_recon):
             return
         decay = self.std_ema
         if self._moments is None:
             self._moments = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+        if self.split_std == "plaid":
+            means = torch.stack(
+                [values.double().mean() for values in (recon_values, diffusion_values)]
+            )
+            stats = torch.cat([means, means.pow(2)])
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(stats)
+                stats = stats / dist.get_world_size()
+            stats = stats.tolist()
+            for index, moments in enumerate(self._moments):
+                moments[0] = decay * moments[0] + (1 - decay) * stats[index]
+                moments[1] = decay * moments[1] + (1 - decay) * stats[index + 2]
+                moments[2] = decay * moments[2] + (1 - decay)
+            return
         for moments, values in zip(self._moments, (recon_values, diffusion_values)):
             if values.numel() == 0:
                 continue
@@ -178,10 +228,29 @@ class OnlineFlashPlaidModel(nn.Module):
             moments[1] = decay * moments[1] + (1 - decay) * float(values.pow(2).mean())
             moments[2] = decay * moments[2] + (1 - decay)
 
+    def _focus_times(self, strata: torch.Tensor):
+        """Map stratified uniforms to ``t`` with density ``(1 - m) / s`` on
+        ``[0, s)`` and ``m / (1 - s)`` on ``[s, 1]``; returns ``(t, 1 / q(t))``."""
+        start, mass = self.t_focus
+        low = strata < 1.0 - mass
+        times = torch.where(
+            low,
+            strata * start / (1.0 - mass),
+            start + (strata - (1.0 - mass)) * (1.0 - start) / mass,
+        )
+        weights = torch.where(
+            low,
+            torch.full_like(strata, start / (1.0 - mass)),
+            torch.full_like(strata, (1.0 - start) / mass),
+        )
+        return times, weights
+
     def _split_and_times(self, shape, device):
-        """``(recon (B, N) bool, t (B, N) float64, recon share p)``. A uniform
-        random subset of the blocks are reconstruction rows (at least one, and
-        at least one diffusion row); the rest get stratified ``t ~ U[0, 1]``."""
+        """``(recon (B, N) bool, t (B, N) float64, importance (B, N) float64,
+        recon share p)``. A uniform random subset of the blocks are
+        reconstruction rows (at least one, and at least one diffusion row); the
+        rest get stratified ``t ~ U[0, 1]`` (or, with ``t_focus``, stratified
+        ``t ~ q`` and importance weights ``1 / q(t)``; 1 elsewhere)."""
         total = math.prod(shape)
         if total < 2:
             raise ValueError("FlashPlaid needs at least two blocks per batch")
@@ -193,9 +262,15 @@ class OnlineFlashPlaidModel(nn.Module):
         num_diffusion = total - num_recon
         strata = torch.rand(num_diffusion, dtype=torch.float64, device=device)
         strata = (strata + torch.arange(num_diffusion, device=device)) / num_diffusion
+        strata = strata[torch.randperm(num_diffusion, device=device)]
+        weights = torch.ones_like(strata)
+        if self.t_focus is not None:
+            strata, weights = self._focus_times(strata)
         times = torch.zeros(total, dtype=torch.float64, device=device)
-        times[order[num_recon:]] = strata[torch.randperm(num_diffusion, device=device)]
-        return recon.view(shape), times.view(shape), num_recon / total
+        times[order[num_recon:]] = strata
+        importance = torch.ones(total, dtype=torch.float64, device=device)
+        importance[order[num_recon:]] = weights
+        return recon.view(shape), times.view(shape), importance.view(shape), num_recon / total
 
     # ------------------------------------------------------------------
     # Stage 1: the teacher's NELBO
@@ -211,6 +286,7 @@ class OnlineFlashPlaidModel(nn.Module):
         weights: torch.Tensor,
         eval_mask: torch.Tensor,
         recon_rows: torch.Tensor,
+        importance: torch.Tensor,
         time_bins: torch.Tensor,
         block_index: torch.Tensor,
         *,
@@ -235,16 +311,18 @@ class OnlineFlashPlaidModel(nn.Module):
         )
         mask = eval_mask.float()
         is_recon = recon_rows.unsqueeze(-1)
+        # 1 / q(t) of a biased time draw (1 for uniform t and recon rows).
+        weighted_diffusion = diffusion * importance.unsqueeze(-1).float()
         # Importance-weighted estimate of each slot's NELBO share.
         estimate = prior + torch.where(
-            is_recon, recon * recon_scale, diffusion * diffusion_scale
+            is_recon, recon * recon_scale, weighted_diffusion * diffusion_scale
         )
         weighted_num = (estimate * weights).sum()
         with torch.no_grad():
             nelbo_num = (estimate * mask).sum()
             recon_num = (torch.where(is_recon, recon * recon_scale, 0.0) * mask).sum()
             diffusion_num = (
-                torch.where(is_recon, 0.0, diffusion * diffusion_scale) * mask
+                torch.where(is_recon, 0.0, weighted_diffusion * diffusion_scale) * mask
             ).sum()
             diffusion_slots = mask * (~is_recon).float()
             diffusion_correct = (correct.float() * diffusion_slots).sum()
@@ -262,7 +340,7 @@ class OnlineFlashPlaidModel(nn.Module):
             bsz, num_blocks, dtype=torch.float32, device=hidden.device
         )
         block_diffusion.scatter_(
-            1, block_index, (diffusion.detach() * weights).sum(dim=-1)
+            1, block_index, (weighted_diffusion.detach() * weights).sum(dim=-1)
         )
         block_recon = torch.zeros_like(block_diffusion)
         block_recon.scatter_(1, block_index, (recon.detach() * weights).sum(dim=-1))
@@ -287,7 +365,9 @@ class OnlineFlashPlaidModel(nn.Module):
         model = self.draft_model
         schedule = model.noise_schedule
 
-        recon_rows, times, recon_share = self._split_and_times((bsz, num_blocks), device)
+        recon_rows, times, importance, recon_share = self._split_and_times(
+            (bsz, num_blocks), device
+        )
         # gamma'(t) by autograd, also under the evaluator's no_grad.
         grad_enabled = torch.is_grad_enabled()
         with torch.enable_grad():
@@ -365,16 +445,33 @@ class OnlineFlashPlaidModel(nn.Module):
             weights,
             eval_mask,
             recon_rows,
+            importance,
             time_bins,
             block_index,
             chunk_size=self.objective_chunk_blocks,
             dim=1,
         )
         hook_state["block_diffusion"] = block_diffusion.detach().double()
-        self._update_moments(
-            block_recon[recon_rows] / recon_share,
-            block_diffusion[~recon_rows] / (1.0 - recon_share),
-        )
+        if self.split_std == "plaid":
+            self._update_moments(block_recon[recon_rows], block_diffusion[~recon_rows])
+        else:
+            self._update_moments(
+                block_recon[recon_rows] / recon_share,
+                block_diffusion[~recon_rows] / (1.0 - recon_share),
+            )
+
+        # The drafting state: every block from N(0, I) at gamma_1, for the
+        # training cross-entropy and the evaluation's simulated acceptance.
+        noise_end = None
+        want_ce = self.training and self.t1_ce_weight > 0
+        want_sim = (not self.training) and self.simulate_acceptance
+        if want_ce or want_sim:
+            noise_end = self._noise_end_terms(
+                z_slots, gamma_1, position_ids, context_kv, context_mask, latent,
+                target_ids, weights, eval_mask, bsz, num_blocks,
+            )
+            if want_ce:
+                weighted_num = weighted_num + self.t1_ce_weight * noise_end[0]
 
         loss_den = weights.sum()
         token_den = eval_mask.float().sum()
@@ -395,6 +492,8 @@ class OnlineFlashPlaidModel(nn.Module):
                 "flashplaid/recon_share": (recon_share * one, one),
                 "flashplaid/latent_eff_rank": (self._effective_rank(latent) * one, one),
             }
+            if noise_end is not None:
+                ratio_metrics["flashplaid/ce_t1"] = (noise_end[0].detach(), loss_den)
             for index in range(NUM_TIME_BINS):
                 ratio_metrics[f"flashplaid/acc@t{index}"] = (
                     bin_correct[index],
@@ -404,7 +503,50 @@ class OnlineFlashPlaidModel(nn.Module):
                     bin_diffusion[index],
                     bin_den[index],
                 )
-        return weighted_num, loss_den, diffusion_correct, diffusion_den, ratio_metrics
+        extra = {}
+        if want_sim:
+            extra["acc_corrects"] = list(noise_end[1].double().unbind())
+            extra["acc_denoms"] = list(noise_end[2].double().unbind())
+        return weighted_num, loss_den, diffusion_correct, diffusion_den, ratio_metrics, extra
+
+    def _noise_end_terms(
+        self, z_like, gamma_1, position_ids, context_kv, context_mask, latent,
+        target_ids, weights, eval_mask, bsz, num_blocks,
+    ):
+        """One-step drafts of every block from ``z ~ N(0, I)`` at ``gamma_1``:
+        ``(sum_k w_k CE_k, conditional corrects (K,), conditional denominators
+        (K,))``. Slot ``k`` counts in the denominator when slots ``< k`` were
+        all correct and it is a label, and in the numerator when it is correct
+        too, so the product of the ratios up to ``k`` is the probability that
+        the first ``k`` drafts are accepted (against the data token)."""
+        model = self.draft_model
+        z = torch.randn_like(z_like)
+        gamma = gamma_1.detach().float().expand(bsz, z.shape[1])
+        hidden = model(z, gamma, position_ids, context_kv, context_mask, latent=latent)
+        hidden = hidden.reshape(bsz, num_blocks, self.block_size, -1)
+        z = z.reshape(bsz, num_blocks, self.block_size, self.latent_dim)
+
+        def terms(hidden, z, target_ids, weights, eval_mask):
+            slot_gamma = gamma_1.detach().float().expand(z.shape[:-1])
+            logits = self.lm_head(hidden).float()
+            logits = logits + model.output_prior_logits(z, slot_gamma, latent)
+            log_probs = logits.log_softmax(dim=-1)
+            ce = -log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+            with torch.no_grad():
+                valid = eval_mask.float()
+                correct = (log_probs.argmax(dim=-1) == target_ids).float() * valid
+                before = torch.cumprod(
+                    torch.cat([torch.ones_like(correct[..., :1]), correct[..., :-1]], dim=-1),
+                    dim=-1,
+                )
+                corrects = (before * correct).sum(dim=(0, 1))
+                denoms = (before * valid).sum(dim=(0, 1))
+            return (ce * weights).sum(), corrects, denoms
+
+        return checkpointed_chunk_reduce(
+            terms, hidden, z, target_ids, weights, eval_mask,
+            chunk_size=self.objective_chunk_blocks, dim=1,
+        )
 
     def _chunk_terms_bound(self, **constants):
         def terms(*aligned):
@@ -439,7 +581,7 @@ class OnlineFlashPlaidModel(nn.Module):
         )
         offsets = torch.arange(1, self.block_size + 1, device=input_ids.device)
         position_ids = (anchor_positions.unsqueeze(-1) + offsets).flatten(1)
-        loss_num, loss_den, correct, eval_den, ratio_metrics = self._teacher_forward(
+        loss_num, loss_den, correct, eval_den, ratio_metrics, extra = self._teacher_forward(
             input_ids,
             hidden_states,
             anchor_positions,
@@ -449,6 +591,7 @@ class OnlineFlashPlaidModel(nn.Module):
             "accuracy_denom": eval_den.detach(),
             "ratio_metrics": ratio_metrics,
             "loss_terms": (loss_num, loss_den.detach()),
+            **extra,
         }
         loss = loss_num / loss_den.clamp_min(torch.finfo(loss_den.dtype).tiny)
         accuracy = correct / eval_den.clamp_min(1.0)

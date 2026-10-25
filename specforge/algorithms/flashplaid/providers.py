@@ -180,6 +180,11 @@ def build_training_model(config, draft_model, draft_config, target_config, token
         objective_chunk_blocks=training.objective_chunk_blocks,
         adaptive_recon=training.flashplaid_adaptive_recon,
         recon_fraction=training.flashplaid_recon_fraction,
+        t1_ce_weight=training.flashplaid_t1_ce_weight,
+        t_focus_start=training.flashplaid_t_focus_start,
+        t_focus_mass=training.flashplaid_t_focus_mass,
+        split_std=training.flashplaid_split_std,
+        simulate_acceptance=training.flashplaid_simulate_acceptance,
     ).to(device=_device(), dtype=_torch_dtype(config))
     draft_model.restore_fp32_modules()
     draft_model.set_target_embedding(target_parts.embed_tokens.weight)
