@@ -140,6 +140,31 @@ def tag_aux_parameters(draft_model, learning_rate: float) -> None:
         parameter._specforge_weight_decay = ENDPOINT_WEIGHT_DECAY if is_endpoint else 0.0
 
 
+def load_schedule(draft_model, checkpoint_dir) -> None:
+    """Copy the noise schedule (``noise_schedule.*``) of a SpecForge checkpoint
+    directory into ``draft_model``."""
+    import os
+
+    import torch
+
+    state = torch.load(
+        os.path.join(checkpoint_dir, "training_state.pt"), map_location="cpu", weights_only=False
+    )["draft_state_dict"]
+    prefix = "noise_schedule."
+    schedule = {key[len(prefix):]: value for key, value in state.items() if key.startswith(prefix)}
+    if not schedule:
+        raise ValueError(f"no noise schedule in {checkpoint_dir}")
+    target = draft_model.noise_schedule
+    reference = next(target.parameters())
+    target.load_state_dict(
+        {key: value.to(device=reference.device, dtype=reference.dtype) for key, value in schedule.items()}
+    )
+    logger.info(
+        "FlashPlaid: noise schedule copied from %s (gamma_0=%.3f, gamma_1=%.3f)",
+        checkpoint_dir, float(target.gamma_0), float(target.gamma_1),
+    )
+
+
 def build_training_model(config, draft_model, draft_config, target_config, tokenizer):
     from specforge.algorithms.flashplaid.model import OnlineFlashPlaidModel
     from specforge.algorithms.model_providers import (
@@ -185,6 +210,8 @@ def build_training_model(config, draft_model, draft_config, target_config, token
         t_focus_mass=training.flashplaid_t_focus_mass,
         split_std=training.flashplaid_split_std,
         simulate_acceptance=training.flashplaid_simulate_acceptance,
+        objective=training.flashplaid_objective,
+        ce_all_weight=training.flashplaid_ce_all_weight,
     ).to(device=_device(), dtype=_torch_dtype(config))
     draft_model.restore_fp32_modules()
     draft_model.set_target_embedding(target_parts.embed_tokens.weight)
@@ -192,6 +219,12 @@ def build_training_model(config, draft_model, draft_config, target_config, token
         # A fresh run (a resume restores the trained table over this).
         initialize_latent_from_target(draft_model, target_parts.embed_tokens.weight)
         logger.info("FlashPlaid: latent table initialized from the target embedding PCA")
+    if training.flashplaid_schedule_init and not config.model.draft_checkpoint_path:
+        load_schedule(draft_model, training.flashplaid_schedule_init)
+    if training.flashplaid_objective == "ce":
+        # Cross-entropy would train the schedule to remove the noise.
+        draft_model.noise_schedule.requires_grad_(False)
+        logger.info("FlashPlaid: objective=ce, noise schedule frozen")
     if not training.flashplaid_learn_endpoints:
         schedule = draft_model.noise_schedule
         schedule.gamma_0.requires_grad_(False)

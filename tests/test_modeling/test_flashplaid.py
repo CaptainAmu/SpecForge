@@ -285,6 +285,36 @@ class FlashPlaidModelTest(unittest.TestCase):
         self.assertEqual(3, len(model._moments[0]))
         self.assertTrue(0.0 < model._current_recon_fraction() < 1.0)
 
+    def test_cross_entropy_objectives(self):
+        draft = randomize(FlashPlaidDraftModel(tiny_config()))
+        results = {}
+        for name, options in (
+            ("nelbo", {}),
+            ("ce_all", {"ce_all_weight": 0.5}),
+            ("ce", {"objective": "ce"}),
+        ):
+            model = wrapper(draft, adaptive_recon=False, **options)
+            torch.manual_seed(11)
+            loss, _, metrics = model(*batch())
+            results[name] = (float(loss), metrics)
+        ratios = results["nelbo"][1]["ratio_metrics"]
+        ce_all, tokens = ratios["flashplaid/ce_all"]
+        _, weight_sum = results["nelbo"][1]["loss_terms"]
+        # The NELBO is reported whatever the objective.
+        torch.testing.assert_close(
+            results["ce"][1]["ratio_metrics"]["nelbo_bpt"][0], ratios["nelbo_bpt"][0]
+        )
+        self.assertNotAlmostEqual(results["ce"][0], results["nelbo"][0], places=3)
+        self.assertGreater(results["ce_all"][0], results["nelbo"][0])
+        # objective="ce" trains no schedule: freeze it, every other weight learns.
+        draft.zero_grad()
+        draft.noise_schedule.requires_grad_(False)
+        model = wrapper(draft, objective="ce")
+        _, _, metrics = model(*batch())
+        metrics["loss_terms"][0].backward()
+        missing = [n for n, p in draft.named_parameters() if p.requires_grad and p.grad is None]
+        self.assertEqual([], missing)
+
     def test_aux_parameters_get_their_own_optimizer_groups(self):
         draft = FlashPlaidDraftModel(tiny_config())
         tag_aux_parameters(draft, 1e-2)

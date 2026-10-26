@@ -29,6 +29,13 @@ wrapper also drafts every block in one step from ``N(0, I)`` and reports
 per-position conditional accuracies (``acc_corrects`` / ``acc_denoms``), from
 which the evaluator's ``simulated_acc_len`` is the expected number of
 accepted draft tokens.
+
+``ce_all_weight`` adds the cross-entropy of every diffusion row at its own t,
+importance-weighted like the diffusion term (an average over t ~ U[0, 1]), with
+no extra forward pass. ``objective="ce"`` replaces the prior and diffusion terms
+by that cross-entropy (reconstruction rows unchanged); the NELBO is still
+computed and reported. The schedule then gets no training signal and must be
+frozen (FlashMap-like flow training on the latent path).
 """
 
 from __future__ import annotations
@@ -52,6 +59,7 @@ from specforge.modeling.draft.flashplaid import FlashPlaidDraftModel, alpha_sigm
 
 STAGES = ("teacher",)
 SPLIT_STD = ("scaled", "plaid")
+OBJECTIVES = ("nelbo", "ce")
 NUM_TIME_BINS = 4
 LN2 = math.log(2.0)
 
@@ -111,6 +119,8 @@ class OnlineFlashPlaidModel(nn.Module):
         t_focus_mass: Optional[float] = None,
         split_std: str = "scaled",
         simulate_acceptance: bool = True,
+        objective: str = "nelbo",
+        ce_all_weight: float = 0.0,
     ):
         super().__init__()
         if stage not in STAGES:
@@ -129,6 +139,10 @@ class OnlineFlashPlaidModel(nn.Module):
             0.0 < t_focus_start < 1.0 and 0.0 < t_focus_mass < 1.0
         ):
             raise ValueError("t_focus_start and t_focus_mass must be in (0, 1)")
+        if objective not in OBJECTIVES:
+            raise ValueError(f"objective must be one of {OBJECTIVES}, got {objective!r}")
+        if ce_all_weight < 0:
+            raise ValueError("ce_all_weight must be >= 0")
         if split_std not in SPLIT_STD:
             raise ValueError(f"split_std must be one of {SPLIT_STD}, got {split_std!r}")
         self.draft_model = draft_model
@@ -148,6 +162,8 @@ class OnlineFlashPlaidModel(nn.Module):
         self.t_focus = None if t_focus_start is None else (float(t_focus_start), float(t_focus_mass))
         self.split_std = split_std
         self.simulate_acceptance = bool(simulate_acceptance)
+        self.objective = objective
+        self.ce_all_weight = float(ce_all_weight)
         # Running first/second moments of the per-block reconstruction and
         # diffusion estimates (Plaid's adaptive batch split); rank-local and
         # not checkpointed: a resume restarts them from recon_fraction.
@@ -317,13 +333,23 @@ class OnlineFlashPlaidModel(nn.Module):
         estimate = prior + torch.where(
             is_recon, recon * recon_scale, weighted_diffusion * diffusion_scale
         )
-        weighted_num = (estimate * weights).sum()
+        # Cross-entropy of the diffusion rows at their own t (``recon`` holds
+        # -log x[y] for every row), as an average over t ~ U[0, 1].
+        diffusion_ce = torch.where(
+            is_recon, 0.0, recon * importance.unsqueeze(-1).float() * diffusion_scale
+        )
+        if self.objective == "ce":
+            objective = torch.where(is_recon, recon * recon_scale, diffusion_ce)
+        else:
+            objective = estimate + self.ce_all_weight * diffusion_ce
+        weighted_num = (objective * weights).sum()
         with torch.no_grad():
             nelbo_num = (estimate * mask).sum()
             recon_num = (torch.where(is_recon, recon * recon_scale, 0.0) * mask).sum()
             diffusion_num = (
                 torch.where(is_recon, 0.0, weighted_diffusion * diffusion_scale) * mask
             ).sum()
+            ce_all_num = (diffusion_ce * mask).sum()
             diffusion_slots = mask * (~is_recon).float()
             diffusion_correct = (correct.float() * diffusion_slots).sum()
             bins = F.one_hot(time_bins, NUM_TIME_BINS).float().unsqueeze(-2)
@@ -339,8 +365,13 @@ class OnlineFlashPlaidModel(nn.Module):
         block_diffusion = torch.zeros(
             bsz, num_blocks, dtype=torch.float32, device=hidden.device
         )
+        # The diffusion rows' term in the objective, for the variance hook and
+        # the adaptive split (the cross-entropy when objective="ce").
+        row_diffusion = (
+            diffusion_ce / diffusion_scale if self.objective == "ce" else weighted_diffusion
+        )
         block_diffusion.scatter_(
-            1, block_index, (weighted_diffusion.detach() * weights).sum(dim=-1)
+            1, block_index, (row_diffusion.detach() * weights).sum(dim=-1)
         )
         block_recon = torch.zeros_like(block_diffusion)
         block_recon.scatter_(1, block_index, (recon.detach() * weights).sum(dim=-1))
@@ -349,6 +380,7 @@ class OnlineFlashPlaidModel(nn.Module):
             nelbo_num,
             recon_num,
             diffusion_num,
+            ce_all_num,
             diffusion_correct,
             diffusion_slots.sum(),
             bin_correct,
@@ -422,6 +454,7 @@ class OnlineFlashPlaidModel(nn.Module):
             nelbo_num,
             recon_num,
             diffusion_num,
+            ce_all_num,
             diffusion_correct,
             diffusion_den,
             bin_correct,
@@ -482,6 +515,7 @@ class OnlineFlashPlaidModel(nn.Module):
                 "nelbo_bpt": (nelbo_num / LN2, token_den),
                 "flashplaid/recon_bpt": (recon_num / LN2, token_den),
                 "flashplaid/diffusion_bpt": (diffusion_num / LN2, token_den),
+                "flashplaid/ce_all": (ce_all_num, token_den),
                 "flashplaid/prior_bpt": (
                     prior_loss(gamma_1_value, self.latent_dim).float() / LN2 * one,
                     one,

@@ -1012,6 +1012,16 @@ class TrainingConfig(StrictConfigModel):
     #: In evaluation, draft every block in one step from N(0, I) and report the
     #: per-position conditional accuracies behind eval/simulated_acc_len.
     flashplaid_simulate_acceptance: bool = True
+    #: "nelbo" (default) or "ce": replace the prior and diffusion terms by the
+    #: cross-entropy of the diffusion rows at their t (reconstruction kept).
+    #: "ce" freezes the noise schedule (it would otherwise learn to remove noise).
+    flashplaid_objective: Literal["nelbo", "ce"] = "nelbo"
+    #: Weight of the cross-entropy of every diffusion row at its own t, added to
+    #: the NELBO (no extra forward pass).
+    flashplaid_ce_all_weight: float = Field(default=0.0, ge=0.0)
+    #: SpecForge checkpoint directory whose learned noise schedule (interior and
+    #: endpoints) replaces the initial one on a fresh start.
+    flashplaid_schedule_init: Optional[str] = None
     #: P-EAGLE COD sampling/model knobs.
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8
