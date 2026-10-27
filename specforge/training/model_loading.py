@@ -379,11 +379,16 @@ def _load_pretrained_draft_state(
     cache_dir: Optional[str],
     trust_remote_code: bool,
 ) -> Dict[str, Any]:
+    import torch
+
     from specforge.modeling.auto import AutoDraftModel
 
+    # float32: keep every tensor exactly as stored (bf16 upcasts losslessly), rather
+    # than casting to the config's dtype, which would round fp32-kept parameters
     loaded, loading_info = AutoDraftModel.from_pretrained(
         source,
         config=draft_config,
+        dtype=torch.float32,
         cache_dir=cache_dir,
         trust_remote_code=trust_remote_code,
         output_loading_info=True,

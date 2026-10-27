@@ -414,6 +414,7 @@ class WarmStartTest(unittest.TestCase):
         load.assert_called_once_with(
             "org/base-draft",
             config=mock.ANY,
+            dtype=torch.float32,
             cache_dir="/cache",
             trust_remote_code=True,
             output_loading_info=True,
